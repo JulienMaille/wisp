@@ -56,6 +56,7 @@ pub struct Config {
     pub dock: bool,
     pub dock_autohide: bool,
     pub dock_icon_size: usize,
+    pub dock_edge: u32,
     pub hotkey: String,
     pub max_results: usize,
     pub theme: Theme,
