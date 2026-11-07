@@ -50,3 +50,8 @@ window_list = "multiple"
 
 # App icons in the dock, in DIPs (24 to 40). The default is 32.
 dock_icon_size = 32
+
+# How close to the bottom edge of a screen the pointer has to get to bring the
+# dock up, in device-independent pixels (96 per inch). Larger values show the
+# dock sooner; the largest is 64.
+dock_edge = 24

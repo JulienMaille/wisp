@@ -48,7 +48,7 @@ Update that install with `winget upgrade SumirSeth.Wisp`.
 
 ## Dock
 
-The dock appears when the pointer touches the bottom edge of a screen, and hides when you move away. To keep it on screen, turn on **Keep the dock visible** in Settings. Maximized windows then stop above it.
+The dock appears when the pointer gets near the bottom edge of a screen (`dock_edge` sets how near), and hides when you move away. To keep it on screen, turn on **Keep the dock visible** in Settings. Maximized windows then stop above it.
 
 | Do this | To |
 | --- | --- |
@@ -57,6 +57,8 @@ The dock appears when the pointer touches the bottom edge of a screen, and hides
 | Middle-click an app | Open a new window of it |
 | Right-click an app | Close its windows |
 | Hover an app with several windows | See its windows. Click one to switch to it, middle-click to close it. |
+| Right-click an app | Pin it to the dock or unpin it, or close its windows |
+| Drag an app | Move it to another place. Pinned apps keep their order. |
 | Click a tray icon | Use it as you would on the taskbar |
 | Click **⌄** | Show the hidden tray icons |
 | Right-click **⌄** | Show the taskbar, or open taskbar settings |
@@ -131,6 +133,7 @@ Open **Settings** from Wisp's tray icon, or edit `%APPDATA%\wisp\config.toml`. T
 | `dock_autohide` | `true` | Hides the dock until the pointer touches the bottom edge. `false` keeps it visible. |
 | `window_list` | `"multiple"` | `"multiple"` lists an app's windows when it has more than one; `"always"` or `"off"` |
 | `dock_icon_size` | `32` | App icon size in the dock, 24–40 DIP. The dock's height, spacing and status area scale with it. |
+| `dock_edge` | `24` | How close to the bottom edge the pointer must get to bring the dock up, in pixels at 100% scale (2 to 64) |
 | `hide_taskbar` | `true` | Hides the Windows taskbar while Wisp runs |
 | `position` | `"bottom"` | `"bottom"` grows the launcher from the dock; `"center"` opens it in the middle |
 | `theme` | `"system"` | `"system"`, `"dark"` or `"light"` |
