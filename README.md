@@ -55,9 +55,8 @@ The dock appears when the pointer gets near the bottom edge of a screen (`dock_e
 | Click an app | Switch to it |
 | Click the app in front | Minimize it |
 | Middle-click an app | Open a new window of it |
-| Right-click an app | Close its windows |
+| Right-click an app | Pin or unpin it, or close its windows |
 | Hover an app with several windows | See its windows. Click one to switch to it, middle-click to close it. |
-| Right-click an app | Pin it to the dock or unpin it, or close its windows |
 | Drag an app | Move it to another place. Pinned apps keep their order. |
 | Click a tray icon | Use it as you would on the taskbar |
 | Click **⌄** | Show the hidden tray icons |

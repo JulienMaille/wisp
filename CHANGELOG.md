@@ -14,6 +14,9 @@ User-facing changes in each release. Each release on GitHub lists these notes an
 
 - The release zip has Wisp's files at its top level, so the install path stays the same across updates. (#50)
 - Wisp installed with winget updates through `winget upgrade` instead of the Update button in Settings. (#50)
+- **Rearrange the dock.** Drag an app to another place.
+- **Pin apps to the dock.** Right-click an app and choose **Pin to dock**. Pinned apps stay in the dock, with a click to launch them, and keep their order between runs. They are saved in `dock-pins.toml`.
+- **The dock comes up sooner.** It now appears when the pointer gets near the bottom edge, not only when it touches it. The new `dock_edge` setting changes the distance. Wisp adds it, with an explanation, to the end of your existing `config.toml`.
 
 ## 0.6.0 - 2026-11-09
 
@@ -32,11 +35,6 @@ User-facing changes in each release. Each release on GitHub lists these notes an
 - Time searches now find English city names on non-English Windows, while still finding names in the Windows display language. (#37, fixes #26)
 - The settings app is a third smaller to download (15.2 MB → 10.0 MB). (#46)
 - Updates download the release zip, and Wisp tells you where to get Settings if it is missing. (#47)
-### New
-
-- **Rearrange the dock.** Drag an app to another place.
-- **Pin apps to the dock.** Right-click an app and choose **Pin to dock**. Pinned apps stay in the dock, with a click to launch them, and keep their order between runs. They are saved in `dock-pins.toml`.
-- **The dock comes up sooner.** It now appears when the pointer gets near the bottom edge, not only when it touches it. The new `dock_edge` setting changes the distance. Wisp adds it, with an explanation, to the end of your existing `config.toml`.
 
 ## 0.5.0 - 2026-11-07
 

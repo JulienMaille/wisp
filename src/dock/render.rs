@@ -3,12 +3,13 @@
 use super::logic::Part;
 use super::status::Status;
 use super::tray::Shown;
-use super::{Item, logic};
+use super::{AppExit, Item, TrayExit, TrayMotion, logic, motion};
 use crate::indexer::IconPixels;
 use crate::theme::Palette;
 use crate::tray_host::Key;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::{Common::*, *};
 use windows::Win32::Graphics::DirectWrite::*;
@@ -62,8 +63,9 @@ pub struct Frame<'a> {
     pub dpi: u32,
     pub palette: &'a Palette,
     pub items: &'a [Item],
+    pub(super) app_motion: &'a HashMap<String, motion::Motion>,
+    pub(super) app_exits: &'a [AppExit],
     pub icons: &'a HashMap<String, Arc<IconPixels>>,
-    pub hover: Option<usize>,
     pub hover_levels: &'a [f32],
     pub app_icon_size: f32,
     pub layout_scale: f32,
@@ -71,9 +73,12 @@ pub struct Frame<'a> {
     pub scroll: usize,
     pub status: &'a Status,
     pub hover_part: Option<Part>,
+    pub hover_part_level: f32,
     pub parts: &'a [Part],
     /// Every shown notification icon, and which of them sit in the dock.
     pub tray: &'a [Shown],
+    pub(super) tray_motion: &'a HashMap<Key, TrayMotion>,
+    pub(super) tray_exits: &'a [TrayExit],
     pub inline: &'a [usize],
     pub flyout_open: bool,
 }
@@ -83,6 +88,8 @@ pub struct FlyoutFrame<'a> {
     pub dpi: u32,
     pub palette: &'a Palette,
     pub tray: &'a [Shown],
+    pub(super) tray_motion: &'a HashMap<Key, TrayMotion>,
+    pub(super) tray_exits: &'a [TrayExit],
     pub hover: Option<usize>,
 }
 
@@ -121,7 +128,7 @@ fn create_formats(dw: &IDWriteFactory, text: PCWSTR, display: PCWSTR, icons: PCW
             DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
-            11.5 * scale,
+            11.5,
             w!("en-us"),
         )?;
         row.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
@@ -477,7 +484,7 @@ fn background(target: &Target, palette: &Palette, layout_scale: f32) {
 
 /// Draws a notification icon centered on (`x`, `y`). Its pixels are made
 /// for this DPI, so they map one to one onto the screen.
-fn tray_icon(target: &mut Target, dpi: u32, shown: &Shown, x: f32, y: f32) -> Result<()> {
+fn tray_icon(target: &mut Target, dpi: u32, shown: &Shown, x: f32, y: f32, opacity: f32) -> Result<()> {
     let Some(pixels) = &shown.pixels else { return Ok(()) };
     let key = shown.icon.key();
     let scale = dpi as f32 / 96.0;
@@ -502,14 +509,58 @@ fn tray_icon(target: &mut Target, dpi: u32, shown: &Shown, x: f32, y: f32) -> Re
             )?;
             target.tray.insert(key, (pixels.clone(), bitmap));
         }
-        let (width, height) = (pixels.width as f32 / scale, pixels.height as f32 / scale);
+        let (width, height) = (
+            pixels.width as f32 / scale * motion::zoom(opacity),
+            pixels.height as f32 / scale * motion::zoom(opacity),
+        );
         let left = ((x - width / 2.0) * scale).round() / scale;
         let top = ((y - height / 2.0) * scale).round() / scale;
         target.rt.DrawBitmap(
             &target.tray[&key].1,
             Some(&rect(left, top, left + width, top + height)),
-            1.0,
+            opacity,
             D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+            None,
+        );
+    }
+    Ok(())
+}
+
+fn draw_app_bitmap(
+    target: &mut Target,
+    key: &str,
+    pixels: &Arc<IconPixels>,
+    area: D2D_RECT_F,
+    opacity: f32,
+) -> Result<()> {
+    let stale = target.bitmaps.get(key).is_none_or(|(old, _)| !Arc::ptr_eq(old, pixels));
+    if stale {
+        let bitmap = unsafe {
+            target.rt.CreateBitmap(
+                D2D_SIZE_U {
+                    width: pixels.width,
+                    height: pixels.height,
+                },
+                Some(pixels.bgra.as_ptr().cast()),
+                pixels.width * 4,
+                &D2D1_BITMAP_PROPERTIES {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                },
+            )?
+        };
+        target.bitmaps.insert(key.to_owned(), (pixels.clone(), bitmap));
+    }
+    unsafe {
+        target.rt.DrawBitmap(
+            &target.bitmaps[key].1,
+            Some(&area),
+            opacity,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
             None,
         );
     }
@@ -518,14 +569,27 @@ fn tray_icon(target: &mut Target, dpi: u32, shown: &Shown, x: f32, y: f32) -> Re
 
 fn draw_flyout(target: &mut Target, frame: &FlyoutFrame) -> Result<()> {
     background(target, frame.palette, 1.0);
-    target
-        .tray
-        .retain(|key, _| frame.tray.iter().any(|shown| shown.icon.key() == *key));
+    target.tray.retain(|key, _| {
+        frame.tray.iter().any(|shown| shown.icon.key() == *key)
+            || frame.tray_exits.iter().any(|exit| exit.shown.icon.key() == *key)
+    });
     let scale = frame.dpi as f32 / 96.0;
     let snap = |dip: f32| (dip * scale).round() / scale;
     let cell = logic::FLYOUT_CELL;
+    let now = Instant::now();
     for (index, shown) in frame.tray.iter().enumerate() {
-        let (left, top) = logic::flyout_cell(index);
+        let key = shown.icon.key();
+        let (left, top, opacity) = frame.tray_motion.get(&key).map_or_else(
+            || {
+                let (left, top) = logic::flyout_cell(index);
+                (left, top, 1.0)
+            },
+            |motion| {
+                let (left, opacity, _) = motion.x.value(now);
+                let (top, _, _) = motion.y.value(now);
+                (left, top, opacity)
+            },
+        );
         if frame.hover == Some(index) {
             unsafe {
                 target.brush.SetColor(&frame.palette.row_selected);
@@ -543,7 +607,19 @@ fn draw_flyout(target: &mut Target, frame: &FlyoutFrame) -> Result<()> {
                 );
             }
         }
-        tray_icon(target, frame.dpi, shown, left + cell / 2.0, top + cell / 2.0)?;
+        tray_icon(target, frame.dpi, shown, left + cell / 2.0, top + cell / 2.0, opacity)?;
+    }
+    for exit in frame.tray_exits {
+        let (left, opacity, _) = exit.motion.x.value(now);
+        let (top, _, _) = exit.motion.y.value(now);
+        tray_icon(
+            target,
+            frame.dpi,
+            &exit.shown,
+            left + cell / 2.0,
+            top + cell / 2.0,
+            opacity,
+        )?;
     }
     Ok(())
 }
@@ -571,45 +647,62 @@ unsafe fn draw(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
             palette: p,
             items,
             icons,
-            hover,
             app_icon_size,
             scroll,
             ..
         } = frame;
         let running = frame.count();
         let foreground = GetForegroundWindow().0 as isize;
+        let now = Instant::now();
         target.bitmaps.retain(|key, _| icons.contains_key(key));
         for index in 0..=running {
             let x = logic::left_scaled(index, frame.layout_scale);
             let slot = logic::slot(frame.layout_scale);
             let item = index.checked_sub(1).and_then(|i| items.get(i + scroll));
+            let (draw_x, opacity) = item.map_or((x, 1.0), |item| {
+                let identity = item.app.id.to_lowercase();
+                frame.app_motion.get(&identity).map_or((x, 1.0), |motion| {
+                    let (position, opacity, _) = motion.value(now);
+                    let absolute_index = (index - 1 + scroll) as f32;
+                    (
+                        x + (position - absolute_index) * logic::SLOT * frame.layout_scale,
+                        opacity,
+                    )
+                })
+            });
             let active = item.is_some_and(|item| item.windows.iter().any(|window| window.hwnd == foreground));
             if active {
+                let mut active_color = p.tile;
+                active_color.a *= opacity;
+                tile(
+                    target,
+                    frame,
+                    draw_x + 2.0 * frame.layout_scale,
+                    draw_x + slot - 2.0 * frame.layout_scale,
+                    &active_color,
+                );
+            }
+            let hover_progress = frame.hover_levels.get(index).copied().unwrap_or(0.0);
+            if hover_progress > 0.0 {
+                let eased = hover_progress * hover_progress * (3.0 - 2.0 * hover_progress);
+                let mut color = p.row_selected;
+                color.a *= eased;
                 tile(
                     target,
                     frame,
                     x + 2.0 * frame.layout_scale,
                     x + slot - 2.0 * frame.layout_scale,
-                    &p.tile,
+                    &color,
                 );
             }
-            if *hover == Some(index) {
-                tile(
-                    target,
-                    frame,
-                    x + 2.0 * frame.layout_scale,
-                    x + slot - 2.0 * frame.layout_scale,
-                    &p.row_selected,
-                );
-            }
-            let progress = frame.hover_levels.get(index).copied().unwrap_or(0.0);
+            let progress = hover_progress;
             let lift = 2.0 * progress * progress * (3.0 - 2.0 * progress);
-            let icon_size = *app_icon_size;
+            let icon_size = *app_icon_size * motion::zoom(opacity);
             let icon_top = ICON_CENTER_Y * frame.layout_scale - icon_size / 2.0 - lift * frame.layout_scale;
             let icon_rect = frame.snap_rect(
-                x + (slot - icon_size) / 2.0,
+                draw_x + (slot - icon_size) / 2.0,
                 icon_top,
-                x + (slot + icon_size) / 2.0,
+                draw_x + (slot + icon_size) / 2.0,
                 icon_top + icon_size,
             );
             let Some(item) = item else {
@@ -627,37 +720,15 @@ unsafe fn draw(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
                 .get_key_value(&item.app.id)
                 .or_else(|| fallback.as_ref().and_then(|key| icons.get_key_value(key)));
             if let Some((key, pixels)) = icon {
-                let stale = target.bitmaps.get(key).is_none_or(|(old, _)| !Arc::ptr_eq(old, pixels));
-                if stale {
-                    let bitmap = target.rt.CreateBitmap(
-                        D2D_SIZE_U {
-                            width: pixels.width,
-                            height: pixels.height,
-                        },
-                        Some(pixels.bgra.as_ptr().cast()),
-                        pixels.width * 4,
-                        &D2D1_BITMAP_PROPERTIES {
-                            pixelFormat: D2D1_PIXEL_FORMAT {
-                                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                            },
-                            dpiX: 96.0,
-                            dpiY: 96.0,
-                        },
-                    )?;
-                    target.bitmaps.insert(key.clone(), (pixels.clone(), bitmap));
-                }
-                target.rt.DrawBitmap(
-                    &target.bitmaps[key].1,
-                    Some(&icon_rect),
-                    1.0,
-                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                    None,
-                );
+                draw_app_bitmap(target, key, pixels, icon_rect, opacity)?;
             } else {
-                target.brush.SetColor(&p.tile);
+                let mut tile_color = p.tile;
+                tile_color.a *= opacity;
+                target.brush.SetColor(&tile_color);
                 target.rt.FillRoundedRectangle(&rounded(icon_rect, 6.0), &target.brush);
-                target.brush.SetColor(&p.text);
+                let mut text_color = p.text;
+                text_color.a *= opacity;
+                target.brush.SetColor(&text_color);
                 let initial = item.app.name.chars().next().unwrap_or('?').to_uppercase().to_string();
                 text(&target.rt, &target.brush, &formats.letter, &initial, icon_rect);
             }
@@ -665,19 +736,63 @@ unsafe fn draw(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
                 // A short dash for running apps, longer and in accent for the foreground one.
                 let half = if active { 6.0 } else { 1.5 };
                 let center = x + slot / 2.0;
-                target.brush.SetColor(if active { &p.accent } else { &p.subtext });
+                let mut indicator = if active { p.accent } else { p.subtext };
+                indicator.a *= opacity;
+                target.brush.SetColor(&indicator);
                 target.rt.FillRoundedRectangle(
                     &rounded(
                         frame.snap_rect(
-                            center - half * frame.layout_scale,
+                            center - half * frame.layout_scale + (draw_x - x),
                             INDICATOR_TOP * frame.layout_scale,
-                            center + half * frame.layout_scale,
+                            center + half * frame.layout_scale + (draw_x - x),
                             (INDICATOR_TOP + 3.0) * frame.layout_scale,
                         ),
                         1.5 * frame.layout_scale,
                     ),
                     &target.brush,
                 );
+            }
+        }
+        for exit in frame.app_exits {
+            let (position, opacity, _) = exit.motion.value(now);
+            if opacity <= 0.0 || position - (*scroll as f32) < -1.0 || position - *scroll as f32 > running as f32 {
+                continue;
+            }
+            let slot = logic::slot(frame.layout_scale);
+            let x = logic::left_scaled(1, frame.layout_scale)
+                + (position - *scroll as f32) * logic::SLOT * frame.layout_scale;
+            let size = *app_icon_size * motion::zoom(opacity);
+            let top = ICON_CENTER_Y * frame.layout_scale - size / 2.0;
+            let rect = frame.snap_rect(x + (slot - size) / 2.0, top, x + (slot + size) / 2.0, top + size);
+            let fallback = exit
+                .item
+                .app
+                .path
+                .as_ref()
+                .map(|path| format!("exe:{}", path.to_lowercase()));
+            if let Some((key, pixels)) = icons
+                .get_key_value(&exit.item.app.id)
+                .or_else(|| fallback.as_ref().and_then(|key| icons.get_key_value(key)))
+            {
+                draw_app_bitmap(target, key, pixels, rect, opacity)?;
+            } else {
+                let mut tile_color = p.tile;
+                tile_color.a *= opacity;
+                target.brush.SetColor(&tile_color);
+                target.rt.FillRoundedRectangle(&rounded(rect, 6.0), &target.brush);
+                let mut text_color = p.text;
+                text_color.a *= opacity;
+                target.brush.SetColor(&text_color);
+                let initial = exit
+                    .item
+                    .app
+                    .name
+                    .chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_uppercase()
+                    .to_string();
+                text(&target.rt, &target.brush, &formats.letter, &initial, rect);
             }
         }
         Ok(())
@@ -727,13 +842,15 @@ fn draw_status(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
         palette: p,
         status,
         hover_part,
+        hover_part_level,
         parts,
         ..
     } = frame;
     let running = frame.count();
-    target
-        .tray
-        .retain(|key, _| frame.tray.iter().any(|shown| shown.icon.key() == *key));
+    target.tray.retain(|key, _| {
+        frame.tray.iter().any(|shown| shown.icon.key() == *key)
+            || frame.tray_exits.iter().any(|exit| exit.shown.icon.key() == *key)
+    });
     separator(
         target,
         frame,
@@ -745,7 +862,19 @@ fn draw_status(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
             continue;
         };
         let right = left + part.width_scaled(frame.layout_scale);
-        if *hover_part == Some(part) || part == Part::Chevron && frame.flyout_open {
+        if *hover_part == Some(part) && *hover_part_level > 0.0 {
+            let mut color = p.row_selected;
+            let eased = *hover_part_level * *hover_part_level * (3.0 - 2.0 * *hover_part_level);
+            color.a *= eased;
+            tile(
+                target,
+                frame,
+                left + 2.0 * frame.layout_scale,
+                right - 2.0 * frame.layout_scale,
+                &color,
+            );
+        }
+        if part == Part::Chevron && frame.flyout_open {
             tile(
                 target,
                 frame,
@@ -771,12 +900,22 @@ fn draw_status(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
             Part::Tray(index) => {
                 if let Some(shown) = frame.inline.get(index).and_then(|&i| frame.tray.get(i)) {
                     let middle = (TILE_TOP + TILE_BOTTOM) / 2.0 * frame.layout_scale;
+                    let motion = frame
+                        .tray_motion
+                        .get(&shown.icon.key())
+                        .and_then(|motion| motion.inline);
+                    let (position, opacity) = motion.map_or((index as f32, 1.0), |motion| {
+                        let (position, opacity, _) = motion.value(Instant::now());
+                        (position, opacity)
+                    });
                     tray_icon(
                         target,
                         frame.dpi,
                         shown,
-                        left + part.width_scaled(frame.layout_scale) / 2.0,
+                        left + part.width_scaled(frame.layout_scale) / 2.0
+                            + (position - index as f32) * logic::TRAY_W * frame.layout_scale,
                         middle,
+                        opacity,
                     )?;
                 }
                 continue;
@@ -823,6 +962,25 @@ fn draw_status(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
                 }
                 Part::Chevron | Part::Tray(_) => {}
             }
+        }
+    }
+    let inline_base = logic::width_scaled(running, frame.layout_scale) - logic::pad(frame.layout_scale)
+        + logic::separator_width(frame.layout_scale)
+        + logic::CHEVRON_W * frame.layout_scale;
+    {
+        let base = inline_base;
+        for exit in frame.tray_exits.iter().filter(|exit| exit.inline_position.is_some()) {
+            let from = exit.inline_position.unwrap_or_default();
+            let (position, opacity, _) = exit.motion.inline.unwrap_or(exit.motion.order).value(Instant::now());
+            tray_icon(
+                target,
+                frame.dpi,
+                &exit.shown,
+                base + (position - from) * logic::TRAY_W * frame.layout_scale
+                    + logic::TRAY_W * frame.layout_scale / 2.0,
+                (TILE_TOP + TILE_BOTTOM) / 2.0 * frame.layout_scale,
+                opacity,
+            )?;
         }
     }
     Ok(())

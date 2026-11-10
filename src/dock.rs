@@ -4,6 +4,8 @@
 mod desktops;
 #[path = "dock/logic.rs"]
 mod logic;
+#[path = "dock/motion.rs"]
+mod motion;
 #[path = "dock/pins.rs"]
 mod pins;
 #[path = "dock/render.rs"]
@@ -41,7 +43,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::{RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE, RegisterRawInputDevices};
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Error, GUID, Result, w};
+use windows::core::{BOOL, Error, GUID, Result, w};
 
 use crate::commands::open_windows::{self, Window};
 use crate::config::{Backdrop, WindowListMode};
@@ -92,6 +94,19 @@ const SLIDE_TIMER: usize = 103;
 const SLIDE_MS: f32 = 180.0;
 const HOVER_TIMER: usize = 105;
 const HOVER_MS: f32 = 110.0;
+/// Windows' Ease of Access preference for client-area animations.
+fn animations_enabled() -> bool {
+    let mut enabled = BOOL(0);
+    let result = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&mut enabled as *mut BOOL).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    result.map_or(true, |_| enabled.as_bool())
+}
 /// Hides the desktop pill after a scroll.
 const DESKTOP_TIMER: usize = 106;
 const DESKTOP_PILL_MS: u32 = 1100;
@@ -99,9 +114,32 @@ const DESKTOP_PILL_MS: u32 = 1100;
 const DESKTOP_PAUSE: Duration = Duration::from_millis(300);
 thread_local! { static EVENT_TARGET: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) }; }
 
-struct Item {
+#[derive(Clone)]
+pub(super) struct Item {
     app: AppEntry,
     windows: Vec<Window>,
+}
+
+#[derive(Clone)]
+pub(super) struct AppExit {
+    pub(super) item: Item,
+    pub(super) identity: String,
+    pub(super) motion: motion::Motion,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TrayMotion {
+    pub(super) order: motion::Motion,
+    pub(super) x: motion::Motion,
+    pub(super) y: motion::Motion,
+    pub(super) inline: Option<motion::Motion>,
+}
+
+#[derive(Clone)]
+pub(super) struct TrayExit {
+    pub(super) shown: tray::Shown,
+    pub(super) motion: TrayMotion,
+    pub(super) inline_position: Option<f32>,
 }
 
 struct State {
@@ -110,6 +148,8 @@ struct State {
     apps: Vec<AppEntry>,
     icons: HashMap<String, Arc<IconPixels>>,
     items: Vec<Item>,
+    app_motion: HashMap<String, motion::Motion>,
+    app_exits: Vec<AppExit>,
     palette: Palette,
     backdrop: Backdrop,
     window_list_mode: WindowListMode,
@@ -124,6 +164,7 @@ struct State {
     capacity: usize,
     status: status::Status,
     hover_part: Option<logic::Part>,
+    hover_part_level: f32,
     /// The pointer touched the bottom edge, so the dock slid in.
     revealed: bool,
     away: u8,
@@ -153,6 +194,7 @@ struct State {
     dragging: bool,
     suspended: bool,
     frame_paced: bool,
+    animations_enabled: bool,
     held_dpi: Option<u32>,
     /// Where the window rests, in physical pixels, and when it began sliding there.
     top: i32,
@@ -175,6 +217,8 @@ struct State {
     /// Hosts the notification area while the taskbar is hidden.
     tray_host: Option<TrayHost>,
     tray: Vec<tray::Shown>,
+    tray_motion: HashMap<tray_host::Key, TrayMotion>,
+    tray_exits: Vec<TrayExit>,
     /// Indices into `tray` of the icons shown in the dock itself.
     inline: Vec<usize>,
     /// Lists every notification icon above the chevron.
@@ -228,6 +272,8 @@ impl Dock {
             apps: Vec::new(),
             icons: HashMap::new(),
             items: Vec::new(),
+            app_motion: HashMap::new(),
+            app_exits: Vec::new(),
             palette: Palette::new(true, true),
             backdrop: Backdrop::Acrylic,
             window_list_mode: WindowListMode::default(),
@@ -242,6 +288,7 @@ impl Dock {
             capacity: usize::MAX,
             status: status::read(),
             hover_part: None,
+            hover_part_level: 0.0,
             revealed: false,
             away: 0,
             poll_ms: POLL_MS,
@@ -256,6 +303,7 @@ impl Dock {
             dragging: false,
             suspended: false,
             frame_paced: false,
+            animations_enabled: animations_enabled(),
             held_dpi: None,
             top: 0,
             slide: None,
@@ -272,6 +320,8 @@ impl Dock {
             surface_rect: None,
             tray_host: None,
             tray: Vec::new(),
+            tray_motion: HashMap::new(),
+            tray_exits: Vec::new(),
             inline: Vec::new(),
             flyout: HWND::default(),
             flyout_open: false,
@@ -720,23 +770,287 @@ impl Drop for Dock {
 }
 
 impl State {
+    fn request_motion_tick(&mut self) {
+        self.hover_tick.get_or_insert_with(Instant::now);
+        unsafe { SetTimer(Some(self.hwnd), HOVER_TIMER, 10, None) };
+    }
+
+    fn update_app_motion(&mut self, old: &[Item], new: &[Item]) {
+        if old.len() == new.len()
+            && old
+                .iter()
+                .zip(new)
+                .all(|(a, b)| a.app.id.eq_ignore_ascii_case(&b.app.id))
+        {
+            return;
+        }
+        let now = Instant::now();
+        let mut prior: HashMap<String, (f32, f32)> = old
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let identity = item.app.id.to_lowercase();
+                let (position, opacity) = self.app_motion.get(&identity).map_or((index as f32, 1.0), |motion| {
+                    let (position, opacity, _) = motion.value(now);
+                    (position, opacity)
+                });
+                (identity, (position, opacity))
+            })
+            .collect();
+        for exit in &self.app_exits {
+            let (position, opacity, _) = exit.motion.value(now);
+            if new.iter().any(|item| item.app.id.eq_ignore_ascii_case(&exit.identity)) {
+                prior.insert(exit.identity.clone(), (position, opacity));
+            }
+        }
+        let new_ids: Vec<_> = new.iter().map(|item| item.app.id.to_lowercase()).collect();
+        self.app_exits
+            .retain(|exit| !new_ids.iter().any(|id| id == &exit.identity));
+        self.app_exits.retain(|exit| exit.motion.value(now).2);
+        self.app_motion.clear();
+        for (index, item) in new.iter().enumerate() {
+            let identity = item.app.id.to_lowercase();
+            let target = index as f32;
+            let (from, opacity_from, duration) = if let Some((position, opacity)) = prior.remove(&identity) {
+                (position, opacity, motion::MOVE_MS)
+            } else {
+                (target, 0.0, motion::ENTER_MS)
+            };
+            if self.animations_enabled && ((from - target).abs() > 0.001 || opacity_from < 0.999) {
+                self.app_motion.insert(
+                    identity,
+                    motion::Motion {
+                        from,
+                        to: target,
+                        opacity_from,
+                        opacity_to: 1.0,
+                        started: now,
+                        duration: Duration::from_millis(duration),
+                    },
+                );
+            }
+        }
+        for item in old {
+            let identity = item.app.id.to_lowercase();
+            if let Some((position, opacity)) = prior.remove(&identity)
+                && self.animations_enabled
+            {
+                self.app_exits.push(AppExit {
+                    item: item.clone(),
+                    identity,
+                    motion: motion::Motion {
+                        from: position,
+                        to: position,
+                        opacity_from: opacity,
+                        opacity_to: 0.0,
+                        started: now,
+                        duration: Duration::from_millis(motion::EXIT_MS),
+                    },
+                });
+            }
+        }
+        if !self.app_motion.is_empty() || !self.app_exits.is_empty() {
+            self.request_motion_tick();
+        }
+    }
+
+    fn update_tray_motion(
+        &mut self,
+        old: &[tray::Shown],
+        old_inline: &[usize],
+        new: &[tray::Shown],
+        new_inline: &[usize],
+    ) {
+        if old
+            .iter()
+            .map(|shown| shown.icon.key())
+            .eq(new.iter().map(|shown| shown.icon.key()))
+            && old_inline == new_inline
+        {
+            return;
+        }
+        let now = Instant::now();
+        let old_inline_rank: HashMap<_, _> = old_inline
+            .iter()
+            .enumerate()
+            .filter_map(|(rank, &index)| old.get(index).map(|shown| (shown.icon.key(), rank as f32)))
+            .collect();
+        let new_inline_rank: HashMap<_, _> = new_inline
+            .iter()
+            .enumerate()
+            .filter_map(|(rank, &index)| new.get(index).map(|shown| (shown.icon.key(), rank as f32)))
+            .collect();
+        let mut prior: HashMap<_, _> = old
+            .iter()
+            .enumerate()
+            .map(|(index, shown)| {
+                let key = shown.icon.key();
+                let old_motion = self.tray_motion.get(&key);
+                let (target_x, target_y) = logic::flyout_cell(index);
+                let (order, opacity) = old_motion.map_or((index as f32, 1.0), |m| {
+                    let (p, a, _) = m.order.value(now);
+                    (p, a)
+                });
+                let (x, y) = old_motion.map_or((target_x, target_y), |m| (m.x.value(now).0, m.y.value(now).0));
+                let inline = old_motion
+                    .and_then(|m| m.inline)
+                    .map(|m| m.value(now).0)
+                    .or_else(|| old_inline_rank.get(&key).copied());
+                (key, (order, opacity, inline, x, y))
+            })
+            .collect();
+        for exit in &self.tray_exits {
+            let key = exit.shown.icon.key();
+            if new.iter().any(|shown| shown.icon.key() == key) {
+                let (order, opacity, _) = exit.motion.order.value(now);
+                let inline = exit.motion.inline.map(|motion| motion.value(now).0);
+                prior.insert(
+                    key,
+                    (
+                        order,
+                        opacity,
+                        inline,
+                        exit.motion.x.value(now).0,
+                        exit.motion.y.value(now).0,
+                    ),
+                );
+            }
+        }
+        self.tray_exits
+            .retain(|exit| !new.iter().any(|shown| shown.icon.key() == exit.shown.icon.key()));
+        self.tray_exits.retain(|exit| exit.motion.order.value(now).2);
+        self.tray_motion.clear();
+        for (index, shown) in new.iter().enumerate() {
+            let key = shown.icon.key();
+            let target = index as f32;
+            let (target_x, target_y) = logic::flyout_cell(index);
+            let (from, opacity_from, inline_from, from_x, from_y) = prior
+                .get(&key)
+                .copied()
+                .unwrap_or_else(|| (target, 0.0, new_inline_rank.get(&key).copied(), target_x, target_y));
+            let order = motion::Motion {
+                from,
+                to: target,
+                opacity_from,
+                opacity_to: 1.0,
+                started: now,
+                duration: Duration::from_millis(if opacity_from < 0.999 {
+                    motion::ENTER_MS
+                } else {
+                    motion::MOVE_MS
+                }),
+            };
+            let inline = new_inline_rank.get(&key).copied().map(|to| {
+                let from = inline_from.unwrap_or(to);
+                motion::Motion {
+                    from,
+                    to,
+                    opacity_from,
+                    opacity_to: 1.0,
+                    started: now,
+                    duration: order.duration,
+                }
+            });
+            let x = motion::Motion {
+                from: from_x,
+                to: target_x,
+                ..order
+            };
+            let y = motion::Motion {
+                from: from_y,
+                to: target_y,
+                ..order
+            };
+            if self.animations_enabled
+                && (opacity_from < 0.999
+                    || (from - target).abs() > 0.001
+                    || (from_x - target_x).abs() > 0.001
+                    || (from_y - target_y).abs() > 0.001
+                    || inline.is_some_and(|m| (m.from - m.to).abs() > 0.001))
+            {
+                self.tray_motion.insert(key, TrayMotion { order, x, y, inline });
+            }
+        }
+        if self.animations_enabled {
+            for (index, shown) in old.iter().enumerate() {
+                let key = shown.icon.key();
+                if new.iter().any(|current| current.icon.key() == key) {
+                    continue;
+                }
+                let (position, opacity, inline_position, x, y) = prior.get(&key).copied().unwrap_or_else(|| {
+                    let (x, y) = logic::flyout_cell(index);
+                    (index as f32, 1.0, None, x, y)
+                });
+                let exiting = motion::Motion {
+                    from: position,
+                    to: position,
+                    opacity_from: opacity,
+                    opacity_to: 0.0,
+                    started: now,
+                    duration: Duration::from_millis(motion::EXIT_MS),
+                };
+                self.tray_exits.push(TrayExit {
+                    shown: shown.clone(),
+                    motion: TrayMotion {
+                        order: exiting,
+                        x: motion::Motion {
+                            from: x,
+                            to: x,
+                            ..exiting
+                        },
+                        y: motion::Motion {
+                            from: y,
+                            to: y,
+                            ..exiting
+                        },
+                        inline: inline_position.map(|p| motion::Motion {
+                            from: p,
+                            to: p,
+                            ..exiting
+                        }),
+                    },
+                    inline_position,
+                });
+            }
+        }
+        if !self.tray_motion.is_empty() || !self.tray_exits.is_empty() {
+            self.request_motion_tick();
+        }
+    }
+
+    fn step_collection_motion(&mut self) -> bool {
+        let now = Instant::now();
+        self.app_motion.retain(|_, motion| motion.value(now).2);
+        self.app_exits.retain(|exit| exit.motion.value(now).2);
+        self.tray_motion.retain(|_, motion| motion.order.value(now).2);
+        self.tray_exits.retain(|exit| exit.motion.order.value(now).2);
+        !self.app_motion.is_empty()
+            || !self.app_exits.is_empty()
+            || !self.tray_motion.is_empty()
+            || !self.tray_exits.is_empty()
+    }
+
     fn paint(&mut self, rt: Option<&windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget>) -> Result<()> {
         let hwnd = self.hwnd;
         let parts = self.parts();
         let State {
             renderer,
             items,
+            app_motion,
+            app_exits,
             icons,
             palette,
             dpi,
-            hover,
             hover_levels,
             app_icon_size,
             capacity,
             scroll,
             status,
             hover_part,
+            hover_part_level,
             tray,
+            tray_motion,
+            tray_exits,
             inline,
             flyout_open,
             ..
@@ -745,8 +1059,9 @@ impl State {
             dpi: *dpi,
             palette,
             items,
+            app_motion,
+            app_exits,
             icons,
-            hover: *hover,
             hover_levels,
             app_icon_size: *app_icon_size,
             layout_scale: logic::layout_scale(*app_icon_size),
@@ -754,8 +1069,11 @@ impl State {
             scroll: *scroll,
             status,
             hover_part: *hover_part,
+            hover_part_level: *hover_part_level,
             parts: &parts,
             tray,
+            tray_motion,
+            tray_exits,
             inline,
             flyout_open: *flyout_open,
         };
@@ -835,9 +1153,12 @@ impl State {
         }
         ordered.append(&mut items);
         let items = ordered;
-        self.items = logic::stable_order(std::mem::take(&mut self.items), items, |old, new| {
+        let old_items = std::mem::take(&mut self.items);
+        let ordered = logic::stable_order(old_items.clone(), items, |old, new| {
             old.app.id.eq_ignore_ascii_case(&new.app.id)
         });
+        self.update_app_motion(&old_items, &ordered);
+        self.items = ordered;
         if let Some(slot) = self.windows_slot
             && self.item_at(slot).is_none_or(|item| {
                 !logic::show_window_list(self.window_list_mode, item.windows.len())
@@ -1076,6 +1397,28 @@ impl State {
             self.hide_windows();
         }
         crate::util::perf::event("slide_begin");
+        if !self.animations_enabled {
+            self.slide = None;
+            self.slide_from = to;
+            self.slide_to = to;
+            let height =
+                (logic::height(logic::layout_scale(self.app_icon_size)) * self.dpi as f32 / 96.0).round() as i32;
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    self.left,
+                    self.top + (height as f32 * to).round() as i32,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                if to >= 1.0 && !self.revealed {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+            }
+            return;
+        }
         self.slide_from = self.slide_value();
         self.slide_to = to;
         self.slide = Some(Instant::now());
@@ -1140,6 +1483,22 @@ impl State {
     }
 
     fn animate_hover(&mut self) {
+        if !self.animations_enabled {
+            self.hover_levels.resize(self.items.len() + 1, 0.0);
+            self.hover_levels.fill(0.0);
+            if let Some(index) = self.hover
+                && let Some(level) = self.hover_levels.get_mut(index)
+            {
+                *level = 1.0;
+            }
+            self.hover_part_level = if self.hover_part.is_some() { 1.0 } else { 0.0 };
+            self.hover_tick = None;
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), HOVER_TIMER);
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
+            return;
+        }
         if self.hover_tick.is_none() {
             self.hover_tick = Some(Instant::now());
         }
@@ -1160,8 +1519,15 @@ impl State {
             *level += (goal - *level).clamp(-step, step);
             moving |= *level != goal;
         }
+        let part_goal = if self.hover_part.is_some() { 1.0 } else { 0.0 };
+        self.hover_part_level += (part_goal - self.hover_part_level).clamp(-step, step);
+        moving |= self.hover_part_level != part_goal;
+        moving |= self.step_collection_motion();
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
+            if self.flyout_open {
+                let _ = InvalidateRect(Some(self.flyout), None, false);
+            }
             if !moving {
                 self.hover_tick = None;
                 let _ = KillTimer(Some(self.hwnd), HOVER_TIMER);
@@ -1215,7 +1581,11 @@ impl State {
                     .into_iter()
                     .map(|shown| shown.icon)
                     .collect();
-                (self.tray, self.inline) = tray::update(Vec::new(), icons, size);
+                let (next_tray, next_inline) = tray::update(Vec::new(), icons, size);
+                self.tray = next_tray;
+                self.inline = next_inline;
+                self.tray_motion.clear();
+                self.tray_exits.clear();
             }
             let size = logic::icon_pixels(self.dpi, self.app_icon_size);
             for item in &self.items {
@@ -1355,7 +1725,12 @@ impl State {
     fn sync_tray(&mut self) {
         let icons = self.tray_host.as_ref().map(TrayHost::icons).unwrap_or_default();
         let size = tray::icon_size(self.dpi);
-        (self.tray, self.inline) = tray::update(std::mem::take(&mut self.tray), icons, size);
+        let old_tray = std::mem::take(&mut self.tray);
+        let old_inline = std::mem::take(&mut self.inline);
+        let (next_tray, next_inline) = tray::update(old_tray.clone(), icons, size);
+        self.update_tray_motion(&old_tray, &old_inline, &next_tray, &next_inline);
+        self.tray = next_tray;
+        self.inline = next_inline;
         if self.flyout_hover.is_some_and(|i| i >= self.tray.len()) {
             self.flyout_hover = None;
         }
@@ -1434,7 +1809,13 @@ impl State {
     /// Sizes the flyout to its icons and centers it above the chevron.
     fn layout_flyout(&mut self) {
         let scale = self.dpi as f32 / 96.0;
-        let (width, height) = logic::flyout_size(self.tray.len());
+        let exit_count = self
+            .tray_exits
+            .iter()
+            .map(|exit| exit.motion.order.to.max(0.0).ceil() as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let (width, height) = logic::flyout_size(self.tray.len().max(exit_count));
         let (width, height) = ((width * scale).round() as i32, (height * scale).round() as i32);
         let Some(chevron) = self.part_rect(logic::Part::Chevron) else {
             return;
@@ -2300,6 +2681,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let dark = s.palette.text.r > 0.5;
                     let backdrop = s.backdrop;
                     s.apply_material(dark, backdrop);
+                    if msg == WM_SETTINGCHANGE {
+                        s.animations_enabled = animations_enabled();
+                        if !s.animations_enabled {
+                            s.stop_slide();
+                            s.hover_tick = None;
+                            let _ = KillTimer(Some(hwnd), HOVER_TIMER);
+                            s.app_motion.clear();
+                            s.app_exits.clear();
+                            s.tray_motion.clear();
+                            s.tray_exits.clear();
+                            s.animate_hover();
+                            let height = (logic::height(logic::layout_scale(s.app_icon_size)) * s.dpi as f32 / 96.0)
+                                .round() as i32;
+                            let offset = if s.revealed { 0 } else { height };
+                            let _ = SetWindowPos(
+                                hwnd,
+                                None,
+                                s.left,
+                                s.top + offset,
+                                0,
+                                0,
+                                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                            );
+                            if !s.revealed {
+                                let _ = ShowWindow(hwnd, SW_HIDE);
+                            }
+                        }
+                    }
                 }
                 WM_REFRESH => {
                     if !s.scheduled {
@@ -2622,6 +3031,8 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let _ = BeginPaint(hwnd, &mut paint);
                 let State {
                     tray,
+                    tray_motion,
+                    tray_exits,
                     palette,
                     dpi,
                     flyout_hover,
@@ -2648,6 +3059,8 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                             dpi: *dpi,
                             palette,
                             tray,
+                            tray_motion,
+                            tray_exits,
                             hover: *flyout_hover,
                         },
                     )

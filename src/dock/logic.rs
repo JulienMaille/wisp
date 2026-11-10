@@ -14,7 +14,21 @@ pub const INDICATOR_TOP: f32 = 46.0;
 
 pub fn slide_value(from: f32, to: f32, progress: f32) -> f32 {
     let t = progress.clamp(0.0, 1.0);
-    let ease = t * t * (3.0 - 2.0 * t);
+    if t == 0.0 {
+        return from;
+    }
+    if t == 1.0 {
+        return to;
+    }
+    let ease = if to < from {
+        // A restrained ease-out-back makes the dock settle just past its
+        // visible position. Hiding remains a monotone smoothstep.
+        const OVERSHOOT: f32 = 1.1;
+        let remaining = t - 1.0;
+        1.0 + (OVERSHOOT + 1.0) * remaining.powi(3) + OVERSHOOT * remaining.powi(2)
+    } else {
+        t * t * (3.0 - 2.0 * t)
+    };
     from + (to - from) * ease
 }
 
@@ -397,6 +411,16 @@ mod tests {
         assert!(slide_value(midway, 0.0, 0.1) < midway);
         assert_eq!(slide_value(0.0, 1.0, 2.0), 1.0);
     }
+
+    #[test]
+    fn slide_in_has_a_small_settle_overshoot_but_slide_out_does_not() {
+        let in_peak = slide_value(1.0, 0.0, 0.65);
+        assert!(in_peak < 0.0);
+        assert!(in_peak > -0.06);
+
+        let out_midpoint = slide_value(0.0, 1.0, 0.65);
+        assert!((0.0..=1.0).contains(&out_midpoint));
+    }
     #[test]
     fn stable_order_keeps_first_seen_positions() {
         let previous = vec!["a", "b", "c"];
@@ -484,18 +508,24 @@ mod tests {
         assert_eq!(width(2), 160.0);
         for count in [0, 1, 8, 30] {
             for index in 0..=count {
-                assert_eq!(hit(left(index) + SLOT / 2.0, HEIGHT / 2.0, count), Some(index));
+                assert_eq!(
+                    hit_scaled(left(index) + SLOT / 2.0, HEIGHT / 2.0, count, 1.0),
+                    Some(index)
+                );
             }
-            assert_eq!(hit(-1.0, 20.0, count), None);
-            assert_eq!(hit(PAD, HEIGHT, count), None);
+            assert_eq!(hit_scaled(-1.0, 20.0, count, 1.0), None);
+            assert_eq!(hit_scaled(PAD, HEIGHT, count, 1.0), None);
             let all = parts(None, true, true);
             let clock = part_left(Part::Clock, count, &all).unwrap();
             assert_eq!(clock + CLOCK_W + PAD, total_width(count, &all));
             let volume = part_left(Part::Volume, count, &all).unwrap();
-            assert_eq!(part_hit(volume - 1.0, 20.0, count, &all), None);
-            assert_eq!(part_hit(clock + 1.0, 20.0, count, &all), Some(Part::Clock));
-            assert_eq!(part_hit(clock - 1.0, 20.0, count, &all), Some(Part::Battery));
-            assert_eq!(part_hit(clock, HEIGHT, count, &all), None);
+            assert_eq!(part_hit_scaled(volume - 1.0, 20.0, count, &all, 1.0), None);
+            assert_eq!(part_hit_scaled(clock + 1.0, 20.0, count, &all, 1.0), Some(Part::Clock));
+            assert_eq!(
+                part_hit_scaled(clock - 1.0, 20.0, count, &all, 1.0),
+                Some(Part::Battery)
+            );
+            assert_eq!(part_hit_scaled(clock, HEIGHT, count, &all, 1.0), None);
             assert_eq!(part_left(Part::Volume, count, &parts(None, false, false)), None);
         }
         for dpi in [96, 120, 144] {
@@ -526,8 +556,8 @@ mod tests {
         assert_eq!(part_left(Part::Tray(0), 2, &tray), Some(chevron + CHEVRON_W));
         let volume = part_left(Part::Volume, 2, &tray).unwrap();
         assert_eq!(volume, chevron + CHEVRON_W + 2.0 * TRAY_W);
-        assert_eq!(part_hit(chevron + 1.0, 20.0, 2, &tray), Some(Part::Chevron));
-        assert_eq!(part_hit(volume - 1.0, 20.0, 2, &tray), Some(Part::Tray(1)));
+        assert_eq!(part_hit_scaled(chevron + 1.0, 20.0, 2, &tray, 1.0), Some(Part::Chevron));
+        assert_eq!(part_hit_scaled(volume - 1.0, 20.0, 2, &tray, 1.0), Some(Part::Tray(1)));
         assert_eq!(
             total_width(2, &tray),
             total_width(2, &parts(None, true, true)) + CHEVRON_W + 2.0 * TRAY_W
