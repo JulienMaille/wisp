@@ -12,6 +12,7 @@ use crate::indexer::IconPixels;
 use crate::tray_host::{Icon, Key};
 
 /// An icon the dock shows, with its pixels at the dock's DPI.
+#[derive(Clone)]
 pub struct Shown {
     pub icon: Icon,
     pub pixels: Option<Arc<IconPixels>>,

@@ -18,7 +18,21 @@ pub const INDICATOR_TOP: f32 = 46.0;
 
 pub fn slide_value(from: f32, to: f32, progress: f32) -> f32 {
     let t = progress.clamp(0.0, 1.0);
-    let ease = t * t * (3.0 - 2.0 * t);
+    if t == 0.0 {
+        return from;
+    }
+    if t == 1.0 {
+        return to;
+    }
+    let ease = if to < from {
+        // A restrained ease-out-back makes the dock settle just past its
+        // visible position. Hiding remains a monotone smoothstep.
+        const OVERSHOOT: f32 = 1.1;
+        let remaining = t - 1.0;
+        1.0 + (OVERSHOOT + 1.0) * remaining.powi(3) + OVERSHOOT * remaining.powi(2)
+    } else {
+        t * t * (3.0 - 2.0 * t)
+    };
     from + (to - from) * ease
 }
 
@@ -1007,6 +1021,16 @@ mod tests {
         assert_eq!(slide_value(midway, 0.0, 0.0), midway);
         assert!(slide_value(midway, 0.0, 0.1) < midway);
         assert_eq!(slide_value(0.0, 1.0, 2.0), 1.0);
+    }
+
+    #[test]
+    fn slide_in_has_a_small_settle_overshoot_but_slide_out_does_not() {
+        let in_peak = slide_value(1.0, 0.0, 0.65);
+        assert!(in_peak < 0.0);
+        assert!(in_peak > -0.06);
+
+        let out_midpoint = slide_value(0.0, 1.0, 0.65);
+        assert!((0.0..=1.0).contains(&out_midpoint));
     }
     #[test]
     fn stable_order_keeps_first_seen_positions() {
