@@ -142,6 +142,8 @@ pub struct FlyoutFrame<'a> {
     pub dpi: u32,
     pub palette: &'a Palette,
     pub tray: &'a [Shown],
+    /// Indices into `tray` of the icons missing from the dock row.
+    pub hidden: &'a [usize],
     pub hover: Option<usize>,
 }
 
@@ -597,13 +599,14 @@ fn tray_icon(target: &mut Target, dpi: u32, shown: &Shown, x: f32, y: f32) -> Re
 
 fn draw_flyout(target: &mut Target, frame: &FlyoutFrame) -> Result<()> {
     background(target, frame.palette, 1.0);
+    let shown: Vec<_> = frame.hidden.iter().filter_map(|&index| frame.tray.get(index)).collect();
     target
         .tray
-        .retain(|key, _| frame.tray.iter().any(|shown| shown.icon.key() == *key));
+        .retain(|key, _| shown.iter().any(|shown| shown.icon.key() == *key));
     let scale = frame.dpi as f32 / 96.0;
     let snap = |dip: f32| (dip * scale).round() / scale;
     let cell = logic::FLYOUT_CELL;
-    for (index, shown) in frame.tray.iter().enumerate() {
+    for (index, icon) in shown.iter().enumerate() {
         let (left, top) = logic::flyout_cell(index);
         if frame.hover == Some(index) {
             unsafe {
@@ -622,7 +625,7 @@ fn draw_flyout(target: &mut Target, frame: &FlyoutFrame) -> Result<()> {
                 );
             }
         }
-        tray_icon(target, frame.dpi, shown, left + cell / 2.0, top + cell / 2.0)?;
+        tray_icon(target, frame.dpi, icon, left + cell / 2.0, top + cell / 2.0)?;
     }
     Ok(())
 }

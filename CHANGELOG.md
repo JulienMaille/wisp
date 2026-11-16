@@ -4,6 +4,10 @@ User-facing changes in each release. Each release on GitHub lists these notes an
 
 ## Unreleased
 
+### Fixes
+
+- The arrow in the dock lists only the notification icons missing from the dock, instead of all of them again. (#104, by @JulienMaille, fixes #40, #53)
+
 ## 0.8.1 - 2026-11-17
 
 ### Fixes
