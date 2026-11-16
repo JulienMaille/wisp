@@ -484,7 +484,9 @@ struct State {
     tray: Vec<tray::Shown>,
     /// Indices into `tray` of the icons shown in the dock itself.
     inline: Vec<usize>,
-    /// Lists every notification icon above the chevron.
+    /// Indices into `tray` of the icons left for the flyout, in cell order.
+    hidden: Vec<usize>,
+    /// Lists the notification icons missing from the dock above the chevron.
     flyout: HWND,
     flyout_open: bool,
     flyout_hover: Option<usize>,
@@ -796,6 +798,7 @@ impl Dock {
             tray_host: None,
             tray: Vec::new(),
             inline: Vec::new(),
+            hidden: Vec::new(),
             flyout: HWND::default(),
             flyout_open: false,
             flyout_hover: None,
@@ -2166,7 +2169,7 @@ impl State {
                     .into_iter()
                     .map(|shown| shown.icon)
                     .collect();
-                (self.tray, self.inline) = tray::update(Vec::new(), icons, size);
+                (self.tray, self.inline, self.hidden) = tray::update(Vec::new(), icons, size);
             }
             let size = logic::icon_pixels(self.dpi, self.app_icon_size);
             self.artwork.drain();
@@ -2290,8 +2293,10 @@ impl State {
             }
         }
         if self.flyout_open {
-            for (index, shown) in self.tray.iter().enumerate() {
-                rects.icons.insert(shown.icon.key(), self.cell_rect(index));
+            for (position, &index) in self.hidden.iter().enumerate() {
+                rects
+                    .icons
+                    .insert(self.tray[index].icon.key(), self.cell_rect(position));
             }
         }
         host.set_rects(rects);
@@ -2301,13 +2306,13 @@ impl State {
     fn sync_tray(&mut self) {
         let icons = self.tray_host.as_ref().map(TrayHost::icons).unwrap_or_default();
         let size = tray::icon_size(self.dpi);
-        (self.tray, self.inline) = tray::update(std::mem::take(&mut self.tray), icons, size);
-        if self.flyout_hover.is_some_and(|i| i >= self.tray.len()) {
+        (self.tray, self.inline, self.hidden) = tray::update(std::mem::take(&mut self.tray), icons, size);
+        if self.flyout_hover.is_some_and(|i| i >= self.hidden.len()) {
             self.flyout_hover = None;
         }
         let stale = match self.tip_target {
             Some(tray::Tip::Inline(i)) => i >= self.inline.len(),
-            Some(tray::Tip::Flyout(i)) => i >= self.tray.len(),
+            Some(tray::Tip::Flyout(i)) => i >= self.hidden.len(),
             Some(tray::Tip::Chevron) => self.tray_host.is_none(),
             Some(tray::Tip::Status(_)) => false,
             // The desktop pill has nothing to do with the tray.
@@ -2337,7 +2342,7 @@ impl State {
             if !self.flyout_open {
                 self.open_flyout();
             }
-            self.flyout_hover = hover.filter(|&i| i < self.tray.len());
+            self.flyout_hover = hover.filter(|&i| i < self.hidden.len());
             self.tip_target = self.flyout_hover.map(tray::Tip::Flyout);
         } else {
             self.tip_target = match self.hover_part {
@@ -2382,7 +2387,7 @@ impl State {
     /// Sizes the flyout to its icons and centers it above the chevron.
     fn layout_flyout(&mut self) {
         let scale = self.dpi as f32 / 96.0;
-        let (width, height) = logic::flyout_size(self.tray.len());
+        let (width, height) = logic::flyout_size(self.hidden.len());
         let (width, height) = ((width * scale).round() as i32, (height * scale).round() as i32);
         let Some(chevron) = self.part_rect(logic::Part::Chevron) else {
             return;
@@ -2717,7 +2722,11 @@ impl State {
                 self.part_rect(logic::Part::Tray(i)),
             ),
             Some(tray::Tip::Flyout(i)) => (
-                self.tray.get(i).map(|shown| shown.icon.tip.clone()).unwrap_or_default(),
+                self.hidden
+                    .get(i)
+                    .and_then(|&index| self.tray.get(index))
+                    .map(|shown| shown.icon.tip.clone())
+                    .unwrap_or_default(),
                 Some(self.cell_rect(i)),
             ),
             None => return,
@@ -3993,7 +4002,7 @@ unsafe fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> L
             logic::flyout_hit(
                 (lp.0 as i16) as f32 / scale,
                 ((lp.0 >> 16) as i16) as f32 / scale,
-                s.tray.len(),
+                s.hidden.len(),
             )
         };
         match msg {
@@ -4002,6 +4011,7 @@ unsafe fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> L
                 let _ = BeginPaint(hwnd, &mut paint);
                 let State {
                     tray,
+                    hidden,
                     palette,
                     dpi,
                     flyout_hover,
@@ -4028,6 +4038,7 @@ unsafe fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> L
                             dpi: *dpi,
                             palette,
                             tray,
+                            hidden,
                             hover: *flyout_hover,
                         },
                     )
@@ -4062,8 +4073,10 @@ unsafe fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> L
             }
             // Like the taskbar's overflow, the flyout closes once an icon is used.
             WM_LBUTTONUP | WM_RBUTTONUP => {
-                if let Some(index) = cell_at(&s, lp) {
-                    let rect = s.cell_rect(index);
+                if let Some(position) = cell_at(&s, lp)
+                    && let Some(&index) = s.hidden.get(position)
+                {
+                    let rect = s.cell_rect(position);
                     let center = POINT {
                         x: (rect.left + rect.right) / 2,
                         y: (rect.top + rect.bottom) / 2,
