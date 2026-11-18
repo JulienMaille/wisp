@@ -3,19 +3,26 @@
 //! Each preview needs a top-level destination window: `DwmRegisterThumbnail`
 //! rejects child windows. The hosts are transparent to the mouse so clicks
 //! reach the popup beneath, and are owned by that popup so they die with it.
+//! A layered overlay above them tints the hovered tile like the taskbar does.
 
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::PAINTSTRUCT;
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::Dwm::{
     DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DWM_THUMBNAIL_PROPERTIES,
     DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
 };
+use windows::Win32::Graphics::Gdi::{
+    COLOR_WINDOW, BeginPaint, EndPaint, FillRect, GetSysColorBrush,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect, HTTRANSPARENT, HWND_TOPMOST, IsWindow, KillTimer,
-    SetTimer, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WM_NCHITTEST, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowRect, HTTRANSPARENT, HWND_TOPMOST,
+    IsWindow, KillTimer, LWA_ALPHA, SetLayeredWindowAttributes,
+    SetTimer, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WM_NCHITTEST,
+    WM_PAINT, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, w};
 
@@ -29,15 +36,19 @@ pub const TIMER: usize = 111;
 const SHOW_MS: u32 = 110;
 const HIDE_MS: u32 = 90;
 const RISE: f32 = 4.0;
+/// Gap between the preview image and the tile edge; the tint covers it too.
+const HOST_INSET: f32 = 2.0;
+/// Alpha of the layered hover wash over a preview, out of 255.
+const HOVER_ALPHA: u8 = 18;
 /// A hovering icon can wobble between neighbouring slots while the dock moves.
 pub const DEBOUNCE: Duration = Duration::from_millis(180);
 
 struct Preview {
     id: isize,
     host: HWND,
-    /// Title row it belongs to, which need not match its index if a source
-    /// window could not be previewed.
-    row: usize,
+    /// Tile column, which need not match the list index if a source window
+    /// could not be previewed.
+    column: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +61,8 @@ struct Anim {
 /// The previews, their animation, and the popup geometry they follow.
 pub struct Thumbnails {
     previews: Vec<Preview>,
+    /// One layered wash, moved over whichever tile the pointer rests on.
+    overlay: HWND,
     anim: Option<Anim>,
     /// Cached source handles, so an unchanged hover does not rebuild hosts.
     targets: Vec<isize>,
@@ -67,6 +80,7 @@ impl Thumbnails {
     pub fn new() -> Self {
         Self {
             previews: Vec::new(),
+            overlay: HWND::default(),
             anim: None,
             targets: Vec::new(),
             base: RECT::default(),
@@ -120,6 +134,11 @@ impl Thumbnails {
                 let _ = DestroyWindow(preview.host);
             }
         }
+        if !self.overlay.is_invalid() {
+            unsafe {
+                let _ = ShowWindow(self.overlay, SW_HIDE);
+            }
+        }
         self.targets.clear();
         self.anim = None;
         self.last_show = None;
@@ -133,7 +152,7 @@ impl Thumbnails {
         self.clear();
         self.targets = targets.to_vec();
         let Ok(instance) = (unsafe { GetModuleHandleW(None) }) else { return };
-        for (row, &target) in targets.iter().enumerate() {
+        for (column, &target) in targets.iter().enumerate() {
             let source = HWND(target as _);
             // DWM can preview minimized windows too, as the taskbar does.
             if !unsafe { IsWindow(Some(source)) }.as_bool() {
@@ -159,7 +178,7 @@ impl Thumbnails {
                 continue;
             };
             match unsafe { DwmRegisterThumbnail(host, source) } {
-                Ok(id) => self.previews.push(Preview { id, host, row }),
+                Ok(id) => self.previews.push(Preview { id, host, column }),
                 Err(error) => {
                     Self::fail("register", &error);
                     unsafe {
@@ -168,16 +187,76 @@ impl Thumbnails {
                 }
             }
         }
+        if self.overlay.is_invalid() {
+            self.overlay = unsafe {
+                CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                    w!("Wisp.DockThumbTint"),
+                    w!(""),
+                    WS_POPUP,
+                    0,
+                    0,
+                    1,
+                    1,
+                    Some(popup),
+                    None,
+                    Some(instance.into()),
+                    None,
+                )
+            }
+            .unwrap_or_default();
+            if !self.overlay.is_invalid() {
+                unsafe {
+                    let _ = SetLayeredWindowAttributes(self.overlay, COLORREF(0), HOVER_ALPHA, LWA_ALPHA);
+                }
+            }
+        }
         self.place(popup, dpi, 1.0);
+    }
+
+    /// Moves the wash over the hovered tile, or hides it when none is hovered.
+    pub fn set_hover(&mut self, popup: HWND, dpi: u32, column: Option<usize>) {
+        if self.overlay.is_invalid() {
+            return;
+        }
+        let Some(preview) = column.and_then(|col| self.previews.iter().find(|p| p.column == col)) else {
+            unsafe { let _ = ShowWindow(self.overlay, SW_HIDE); }
+            return;
+        };
+        let scale = dpi as f32 / 96.0;
+        let (left, top, width, height) = Self::tile(popup, scale, preview.column);
+        unsafe {
+            let _ = SetWindowPos(
+                self.overlay,
+                Some(HWND_TOPMOST),
+                left,
+                top,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+
+    /// Screen rect of a tile's outer bounds.
+    fn tile(popup: HWND, scale: f32, column: usize) -> (i32, i32, i32, i32) {
+        let pad = (logic::THUMB_PAD * scale).round() as i32;
+        let width = (logic::THUMB_W * scale).round() as i32;
+        let height = (logic::THUMB_TILE_H * scale).round() as i32;
+        let step = width + pad;
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(popup, &mut rect) }.is_err() {
+            return (0, 0, 0, 0);
+        }
+        (rect.left + pad + column as i32 * step, rect.top + pad, width, height)
     }
 
     /// Moves the previews to follow the popup and applies the current fade.
     pub fn place(&mut self, popup: HWND, dpi: u32, amount: f32) {
         let scale = dpi as f32 / 96.0;
-        let pad = (logic::THUMB_PAD * scale).round() as i32;
-        let width = (logic::THUMB_W * scale).round() as i32;
-        let height = (logic::THUMB_H * scale).round() as i32;
-        let row = (logic::THUMB_ROW * scale).round() as i32;
+        let inset = (HOST_INSET * scale).round() as i32;
+        let image_width = (logic::THUMB_W * scale).round() as i32 - 2 * inset;
+        let image_height = (logic::THUMB_H * scale).round() as i32 - 2 * inset;
         let opacity = (255.0 * amount).round().clamp(0.0, 255.0) as u8;
         let mut rect = RECT::default();
         if let Err(error) = unsafe { GetWindowRect(popup, &mut rect) } {
@@ -185,15 +264,15 @@ impl Thumbnails {
             return;
         }
         for preview in &self.previews {
-            let top = rect.top + pad + preview.row as i32 * row;
+            let (left, top, _, _) = Self::tile(popup, scale, preview.column);
             unsafe {
                 let _ = SetWindowPos(
                     preview.host,
                     Some(HWND_TOPMOST),
-                    rect.left + pad,
-                    top,
-                    width,
-                    height,
+                    left + inset,
+                    top + inset,
+                    image_width,
+                    image_height,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
             }
@@ -202,8 +281,8 @@ impl Thumbnails {
                 rcDestination: RECT {
                     left: 0,
                     top: 0,
-                    right: width,
-                    bottom: height,
+                    right: image_width,
+                    bottom: image_height,
                 },
                 rcSource: RECT::default(),
                 opacity,
@@ -295,6 +374,26 @@ impl Thumbnails {
     }
 }
 
+/// A translucent wash over the hovered tile. Windows paints it with the
+/// theme's window brush; the layered alpha keeps it barely there.
+pub unsafe extern "system" fn tint_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        if msg == WM_NCHITTEST {
+            return LRESULT(HTTRANSPARENT as isize);
+        }
+        if msg == WM_PAINT {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            FillRect(hdc, &client, GetSysColorBrush(COLOR_WINDOW));
+            let _ = EndPaint(hwnd, &paint);
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, wp, lp)
+    }
+}
+
 /// A thumbnail host: transparent to the mouse, with no painting of its own.
 pub unsafe extern "system" fn thumb_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
@@ -313,7 +412,7 @@ mod tests {
 
     #[test]
     fn fade_is_monotone_in_each_direction() {
-        let mut thumbs = Thumbnails::new();
+        let thumbs = Thumbnails::new();
         // With no previews registered, amount is the fully shown state.
         assert_eq!(thumbs.amount(), 1.0);
         assert!(!thumbs.animating_out());

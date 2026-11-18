@@ -968,6 +968,17 @@ impl Dock {
         if unsafe { RegisterClassExW(&thumb) } == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
             return Err(Error::from_thread());
         }
+        let tint = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(thumbnails::tint_wndproc),
+            hInstance: instance.into(),
+            lpszClassName: w!("Wisp.DockThumbTint"),
+            hCursor: class.hCursor,
+            ..Default::default()
+        };
+        if unsafe { RegisterClassExW(&tint) } == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
+            return Err(Error::from_thread());
+        }
         for (kind, style, title) in [
             // The flyout takes focus, for Esc and closing on a click elsewhere.
             (Popup::Flyout, WS_EX_TOOLWINDOW | WS_EX_TOPMOST, w!("Notification area")),
@@ -3054,8 +3065,9 @@ impl State {
         let anchor = self.item_rect(slot);
         let gap = (6.0 * scale).round() as i32;
         let available = anchor.top - gap - (info.rcWork.top + gap);
+        let wide = info.rcWork.right - info.rcWork.left - 2 * gap;
         let capacity = if thumbnails {
-            logic::thumbnail_rows(available, scale)
+            logic::thumbnail_columns(wide, scale)
         } else {
             logic::window_list_rows(available, scale, logic::LIST_PAD.1)
         };
@@ -3074,11 +3086,8 @@ impl State {
         }
         let (width, height) = if thumbnails {
             let more = rows.last().is_some_and(|row| row.starts_with('+'));
-            let previews = rows.len() - usize::from(more);
-            (
-                ((logic::THUMB_W + 2.0 * logic::THUMB_PAD) * scale).ceil() as i32,
-                logic::thumbnail_height(previews, more, scale),
-            )
+            let tiles = rows.len() - usize::from(more);
+            (logic::thumbnail_width(tiles, more, scale), logic::thumbnail_height(scale))
         } else {
             let Ok((width, height)) = self.windows_renderer.measure_windows(&rows) else {
                 self.hide_windows();
@@ -3113,15 +3122,18 @@ impl State {
         });
     }
 
-    /// The row of the window list under a popup pointer position.
+    /// The window row or preview tile under a popup pointer position.
     fn windows_hit(&self, lp: LPARAM) -> Option<usize> {
         let scale = self.dpi as f32 / 96.0;
+        if self.window_list_mode == WindowListMode::Thumbnails {
+            let x = (lp.0 as u16) as f32 / scale;
+            let column = (x - logic::THUMB_PAD) / (logic::THUMB_W + logic::THUMB_PAD);
+            return (column >= 0.0)
+                .then_some(column as usize)
+                .filter(|&column| column < self.windows_targets.len());
+        }
         let y = ((lp.0 >> 16) as i16) as f32 / scale;
-        let row = if self.window_list_mode == WindowListMode::Thumbnails {
-            (y - logic::THUMB_PAD) / logic::THUMB_ROW
-        } else {
-            (y - logic::LIST_PAD.1) / logic::LIST_ROW
-        };
+        let row = (y - logic::LIST_PAD.1) / logic::LIST_ROW;
         (row >= 0.0)
             .then_some(row as usize)
             .filter(|&row| row < self.windows_targets.len())
@@ -4403,6 +4415,8 @@ unsafe fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> L
                     let hover = s.windows_hit(lp);
                     if s.windows_hover != hover {
                         s.windows_hover = hover;
+                        let (popup, dpi) = (s.windows, s.dpi);
+                        s.thumbnails.set_hover(popup, dpi, hover);
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     let _ = TrackMouseEvent(&mut TRACKMOUSEEVENT {

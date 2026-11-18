@@ -374,17 +374,18 @@ impl Renderer {
             for (index, row) in rows.iter().enumerate() {
                 let (line, highlight) = if previews {
                     let pad = logic::THUMB_PAD;
+                    let step = logic::THUMB_W + pad;
                     if more && index == tiles {
-                        // The "+N more" row is text only and sits below the tiles.
-                        let top = pad + tiles as f32 * logic::THUMB_ROW;
-                        let slim = rect(pad, top, size.width - pad, top + logic::THUMB_MORE_H);
+                        // The "+N more" tile is text only and sits at the end.
+                        let left = pad + tiles as f32 * step;
+                        let slim = rect(left, pad, left + logic::THUMB_MORE_W, pad + logic::THUMB_TILE_H);
                         (slim, slim)
                     } else {
-                        let top = pad + index as f32 * logic::THUMB_ROW;
-                        let title = top + logic::THUMB_H;
+                        let left = pad + index as f32 * step;
+                        let title = pad + logic::THUMB_H;
                         (
-                            rect(pad, title, size.width - pad, title + logic::THUMB_TITLE_H),
-                            rect(pad, top, size.width - pad, title + logic::THUMB_TITLE_H),
+                            rect(left, title, left + logic::THUMB_W, title + logic::THUMB_TITLE_H),
+                            rect(left, pad, left + logic::THUMB_W, pad + logic::THUMB_TILE_H),
                         )
                     }
                 } else {

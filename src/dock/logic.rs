@@ -751,20 +751,36 @@ pub const CLOCK_W: f32 = 88.0;
 pub const LIST_PAD: (f32, f32) = (7.0, 3.0);
 pub const LIST_ROW: f32 = 22.0;
 pub const LIST_TEXT_MAX: f32 = 280.0;
-/// Live window previews, in DIPs: one thumbnail per window with its title below.
+/// Live window previews, in DIPs: previews sit side by side with titles below.
 pub const THUMB_W: f32 = 200.0;
 pub const THUMB_H: f32 = 112.5;
 pub const THUMB_TITLE_H: f32 = 20.0;
-pub const THUMB_ROW: f32 = THUMB_H + THUMB_TITLE_H;
-/// The overflow row is text only and must not reserve a whole preview tile.
-pub const THUMB_MORE_H: f32 = 24.0;
+pub const THUMB_TILE_H: f32 = THUMB_H + THUMB_TITLE_H;
+/// The overflow tile is text only, so it need not be as wide as a preview.
+pub const THUMB_MORE_W: f32 = 76.0;
 pub const THUMB_PAD: f32 = 6.0;
-/// Physical-pixel height of a preview popup: full rows plus a slim overflow row.
-pub fn thumbnail_height(previews: usize, more: bool, scale: f32) -> i32 {
-    let dip = previews as f32 * THUMB_ROW
-        + if more { THUMB_MORE_H } else { 0.0 }
-        + 2.0 * THUMB_PAD;
+/// Width of a row of `tiles` previews plus an optional slim overflow tile.
+pub fn thumbnail_width(tiles: usize, more: bool, scale: f32) -> i32 {
+    let dip = tiles as f32 * THUMB_W
+        + if more { THUMB_MORE_W } else { 0.0 }
+        + (tiles + usize::from(more) + 1) as f32 * THUMB_PAD;
     (dip * scale).ceil() as i32
+}
+
+/// Physical-pixel height of a preview popup: one tile plus both paddings.
+pub fn thumbnail_height(scale: f32) -> i32 {
+    ((THUMB_TILE_H + 2.0 * THUMB_PAD) * scale).ceil() as i32
+}
+
+/// How many preview tiles fit in a physical-pixel width, including paddings.
+pub fn thumbnail_columns(available: i32, scale: f32) -> usize {
+    let dip = available.max(0) as f32 / scale;
+    let columns = ((dip - THUMB_PAD) / (THUMB_W + THUMB_PAD)).floor() as usize;
+    if columns > 0 && thumbnail_width(columns, false, scale) > available {
+        columns - 1
+    } else {
+        columns
+    }
 }
 /// Whole rows that fit in a physical-pixel height, including both DIP paddings.
 /// The popup rounds to whole physical pixels at fractional scales.
@@ -781,11 +797,6 @@ fn list_rows(available: i32, scale: f32, padding: f32, row: f32) -> usize {
 /// Whole rows of window titles that fit in a physical-pixel height.
 pub fn window_list_rows(available: i32, scale: f32, padding: f32) -> usize {
     list_rows(available, scale, padding, LIST_ROW)
-}
-
-/// Whole previews that fit in a physical-pixel height.
-pub fn thumbnail_rows(available: i32, scale: f32) -> usize {
-    list_rows(available, scale, THUMB_PAD, THUMB_ROW)
 }
 
 pub fn show_window_list(mode: WindowListMode, windows: usize) -> bool {
@@ -1540,24 +1551,24 @@ mod tests {
     }
 
     #[test]
-    fn thumbnails_fit_whole_rows_with_padding_at_each_scale() {
+    fn thumbnails_fit_whole_columns_with_padding_at_each_scale() {
         for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
-            for rows in [1, 2, 3] {
-                let height = ((rows as f32 * THUMB_ROW + 2.0 * THUMB_PAD) * scale).ceil() as i32;
-                assert_eq!(thumbnail_rows(height, scale), rows);
-                assert_eq!(thumbnail_rows(height - 1, scale), rows - 1);
+            for columns in [1, 2, 3] {
+                let width = thumbnail_width(columns, false, scale);
+                assert_eq!(thumbnail_columns(width, scale), columns);
+                assert_eq!(thumbnail_columns(width - 1, scale), columns - 1);
             }
         }
-        assert_eq!(thumbnail_rows(0, 1.0), 0);
+        assert_eq!(thumbnail_columns(0, 1.0), 0);
     }
 
     #[test]
-    fn overflow_row_does_not_take_a_full_tile() {
+    fn overflow_tile_is_narrower_than_a_preview() {
         for scale in [1.0, 1.25, 1.5, 2.0] {
-            let full = thumbnail_height(2, false, scale);
-            let with_more = thumbnail_height(1, true, scale);
-            assert!(with_more < full);
-            assert_eq!(thumbnail_height(2, true, scale) - full, (THUMB_MORE_H * scale).ceil() as i32);
+            let one = thumbnail_width(1, false, scale);
+            let with_more = thumbnail_width(1, true, scale);
+            assert!(with_more > one);
+            assert!(with_more < thumbnail_width(2, false, scale));
         }
     }
 
