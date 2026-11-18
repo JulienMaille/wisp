@@ -15,13 +15,18 @@ use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::UI::WindowId;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_USAGE_STAGING, D3D11CreateDevice, D3D11_MAPPED_SUBRESOURCE,
     D3D11_TEXTURE2D_DESC, D3D11_SDK_VERSION, ID3D11Device, ID3D11DeviceContext,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
+    DeleteObject, GetDIBits, SelectObject,
+};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, PW_RENDERFULLCONTENT};
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, PM_REMOVE};
@@ -51,6 +56,8 @@ struct Stream {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     token: i64,
+    width: u32,
+    height: u32,
 }
 
 /// A WGC worker plus the frames it has produced, read by the dock thread.
@@ -117,6 +124,7 @@ fn worker(commands: Receiver<Command>, frames: Sender<Frame>) {
         Thumbnails::debug("WGC RoInitialize", &error);
     }
     let mut streams: HashMap<isize, Stream> = HashMap::new();
+    let mut last_refresh = std::time::Instant::now();
     let mut device = None;
     if let Err(error) = unsafe {
         D3D11CreateDevice(
@@ -193,6 +201,19 @@ fn worker(commands: Receiver<Command>, frames: Sender<Frame>) {
         let mut msg = Default::default();
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
             let _ = unsafe { DispatchMessageW(&msg) };
+        }
+        // WGC throttles occluded windows to a trickle. Refresh them on demand
+        // so a hovered preview does not sit on a stale frame.
+        if last_refresh.elapsed() >= Duration::from_millis(150) {
+            last_refresh = std::time::Instant::now();
+            for (hwnd, stream) in &streams {
+                if let Some(pixels) = print_window(*hwnd, stream.width, stream.height) {
+                    let _ = frames.send(Frame {
+                        hwnd: *hwnd,
+                        pixels: Arc::new(pixels),
+                    });
+                }
+            }
         }
     }
     let keys: Vec<isize> = streams.keys().copied().collect();
@@ -288,6 +309,8 @@ fn start_stream(
         pool,
         session,
         token,
+        width,
+        height,
     });
 }
 
@@ -296,6 +319,79 @@ fn stop_stream(streams: &mut HashMap<isize, Stream>, hwnd: isize) {
         let _ = stream.session.Close();
         let _ = stream.pool.RemoveFrameArrived(stream.token);
         let _ = stream.pool.Close();
+    }
+}
+
+/// Prints a window on demand, downsampled to the tile. This keeps previews
+/// fresh when WGC stops delivering frames for an occluded window.
+fn print_window(hwnd: isize, target_w: u32, target_h: u32) -> Option<IconPixels> {
+    let source = HWND(hwnd as *mut core::ffi::c_void);
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(source, &mut rect) }.is_err() {
+        return None;
+    }
+    let (sw, sh) = ((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32);
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        let bitmap = CreateCompatibleBitmap(dc, sw as i32, sh as i32);
+        if dc.is_invalid() || bitmap.is_invalid() {
+            if !bitmap.is_invalid() { let _ = DeleteObject(bitmap.into()); }
+            if !dc.is_invalid() { let _ = DeleteDC(dc); }
+            return None;
+        }
+        let old = SelectObject(dc, bitmap.into());
+        let printed = windows::Win32::Storage::Xps::PrintWindow(source, dc, windows::Win32::Storage::Xps::PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool();
+        let mut header = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: sw as i32,
+                biHeight: -(sh as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bgra = vec![0u8; (sw * sh * 4) as usize];
+        let lines = if printed {
+            GetDIBits(
+                dc,
+                bitmap,
+                0,
+                sh,
+                Some(bgra.as_mut_ptr().cast()),
+                &mut header,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
+        if !old.is_invalid() { let _ = SelectObject(dc, old); }
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(dc);
+        if lines == 0 {
+            return None;
+        }
+        let (dw, dh) = (target_w as usize, target_h as usize);
+        let mut out = vec![0u8; dw * dh * 4];
+        for y in 0..dh {
+            let sy = (y * sh as usize / dh).min(sh as usize - 1);
+            for x in 0..dw {
+                let sx = (x * sw as usize / dw).min(sw as usize - 1);
+                let src = (sy * sw as usize + sx) * 4;
+                let dst = (y * dw + x) * 4;
+                out[dst..dst + 4].copy_from_slice(&bgra[src..src + 4]);
+            }
+        }
+        Some(IconPixels {
+            width: target_w,
+            height: target_h,
+            bgra: out,
+        })
     }
 }
 
@@ -353,6 +449,7 @@ fn copy_frame(
         })
     }
 }
+
 
 
 
