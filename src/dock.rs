@@ -20,6 +20,8 @@ pub mod space;
 
 #[path = "dock/status.rs"]
 mod status;
+#[path = "dock/thumbnails.rs"]
+mod thumbnails;
 #[path = "dock/tray.rs"]
 mod tray;
 
@@ -101,6 +103,8 @@ const TIP_MAX: f32 = 320.0;
 const WINDOWS_TIMER: usize = 107;
 const WINDOWS_HIDE_TIMER: usize = 108;
 const WINDOWS_HIDE_MS: u32 = 220;
+/// The last timer ID handled by the dock's wndproc.
+const LAST_TIMER: usize = thumbnails::TIMER;
 const REFRESH_TIMER: usize = 101;
 /// WM_REFRESH's wParam when only other apps' windows changed.
 const REFRESH_WINDOWS: usize = 1;
@@ -552,6 +556,8 @@ struct State {
     windows_slot: Option<usize>,
     windows_rows: Vec<String>,
     windows_targets: Vec<isize>,
+    /// Live previews and their fade, owned for the popup's lifetime.
+    thumbnails: thumbnails::Thumbnails,
     /// Each window's program and app ID, read once and checked again after
     /// [`WINDOW_ID_TTL`]: reading an app ID asks the shell.
     window_ids: HashMap<isize, WindowId>,
@@ -879,6 +885,7 @@ impl Dock {
             windows_slot: None,
             windows_rows: Vec::new(),
             windows_targets: Vec::new(),
+            thumbnails: thumbnails::Thumbnails::new(),
             window_ids: HashMap::new(),
             app_matches: HashMap::new(),
             matched_pins: 0,
@@ -946,6 +953,19 @@ impl Dock {
             ..Default::default()
         };
         if unsafe { RegisterClassExW(&popup) } == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
+            return Err(Error::from_thread());
+        }
+        // DWM thumbnails need a top-level destination window; each preview
+        // gets its own host above the popup's Direct2D surface.
+        let thumb = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(thumbnails::thumb_wndproc),
+            hInstance: instance.into(),
+            lpszClassName: w!("Wisp.DockThumb"),
+            hCursor: class.hCursor,
+            ..Default::default()
+        };
+        if unsafe { RegisterClassExW(&thumb) } == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
             return Err(Error::from_thread());
         }
         for (kind, style, title) in [
@@ -1079,7 +1099,7 @@ impl Dock {
     }
 
     pub fn owns_message(msg: u32, wp: WPARAM) -> bool {
-        msg == WM_TIMER && (REFRESH_TIMER..=DODGE_TIMER).contains(&wp.0)
+        msg == WM_TIMER && (REFRESH_TIMER..=LAST_TIMER).contains(&wp.0)
             || matches!(
                 msg,
                 WM_DOCK_DODGE
@@ -2825,6 +2845,10 @@ impl State {
                     .is_some_and(|item| logic::show_window_list(self.window_list_mode, item.windows.len()))
         });
         if self.windows_slot == slot {
+            // Returning to the same icon during a fade out should keep it open.
+            if slot.is_some() {
+                self.cancel_thumb_hide();
+            }
             return;
         }
         let shown = self.windows_slot.is_some();
@@ -2843,8 +2867,52 @@ impl State {
         slot.checked_sub(1).and_then(|i| self.items.get(i + self.scroll))
     }
 
+    /// Drops every live preview when the popup closes or its windows change.
+    fn clear_thumbnails(&mut self) {
+        self.thumbnails.clear();
+    }
+
+    /// Registers previews for the windows the popup will actually show.
+    fn register_thumbnails(&mut self) {
+        if self.window_list_mode != WindowListMode::Thumbnails {
+            self.thumbnails.clear();
+            return;
+        }
+        self.thumbnails.sync(self.windows, &self.windows_targets, self.dpi);
+    }
+
+    /// Applies the current fade to the previews and the popup.
+    fn place_thumbnails(&mut self, amount: f32) {
+        self.thumbnails.place(self.windows, self.dpi, amount);
+    }
+
+    /// Advances the fade, closing the popup when a hide finishes.
+    fn step_thumb_anim(&mut self) {
+        if self.thumbnails.step(self.hwnd, self.windows, self.dpi) {
+            self.hide_windows();
+        }
+    }
+
+    /// Starts the fade in when the previews first appear.
+    fn show_thumb_anim(&mut self) {
+        self.thumbnails.begin_show(self.hwnd, self.windows, self.dpi);
+    }
+
+    /// Starts the fade out, closing at once when there is nothing to animate.
+    fn hide_thumb_anim(&mut self) {
+        if !self.thumbnails.begin_hide(self.hwnd) {
+            self.hide_windows();
+        }
+    }
+
+    /// Reverses a fade out if the pointer came back before it finished.
+    fn cancel_thumb_hide(&mut self) {
+        self.thumbnails.cancel_hide();
+    }
+
     /// Hides the window list and forgets its windows.
     fn hide_windows(&mut self) {
+        self.clear_thumbnails();
         if !self.name_hook.is_invalid() {
             unsafe {
                 let _ = UnhookWinEvent(self.name_hook);
@@ -2858,6 +2926,7 @@ impl State {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), WINDOWS_TIMER);
             let _ = KillTimer(Some(self.hwnd), WINDOWS_HIDE_TIMER);
+            let _ = KillTimer(Some(self.hwnd), thumbnails::TIMER);
             let _ = ShowWindow(self.windows, SW_HIDE);
         }
     }
@@ -2888,14 +2957,32 @@ impl State {
             return;
         }
         let Some(slot) = self.windows_slot else { return };
+        let count = self.item_at(slot).map_or(0, |item| item.windows.len());
+        if !logic::show_window_list(self.window_list_mode, count) {
+            self.hide_windows();
+            return;
+        }
+        if self.window_list_mode == WindowListMode::Thumbnails {
+            // A hovering icon can wobble between neighbouring slots while the
+            // dock animates. Delay, but never drop, the update: the slot has
+            // already changed, so leaving stale previews on screen is worse
+            // than showing them a moment later.
+            let debounce = thumbnails::DEBOUNCE;
+            if let Some(at) = self.thumbnails.last_show() {
+                let elapsed = at.elapsed();
+                if elapsed < debounce {
+                    unsafe {
+                        let _ = SetTimer(Some(self.hwnd), WINDOWS_TIMER, (debounce - elapsed).as_millis() as u32, None);
+                    }
+                    return;
+                }
+            }
+            self.thumbnails.note_show();
+        }
         let Some(item) = self.item_at(slot) else {
             self.hide_windows();
             return;
         };
-        if !logic::show_window_list(self.window_list_mode, item.windows.len()) {
-            self.hide_windows();
-            return;
-        }
         let rows: Vec<String> = item
             .windows
             .iter()
@@ -2924,6 +3011,8 @@ impl State {
             };
         }
         self.layout_windows(slot, rows, targets);
+        self.register_thumbnails();
+        self.show_thumb_anim();
     }
 
     /// Updates titles by handle, preserving the displayed order and click targets
@@ -2946,12 +3035,14 @@ impl State {
         }
         if rows != self.windows_rows {
             self.layout_windows(slot, rows, self.windows_targets.clone());
+            self.place_thumbnails(self.thumbnails.amount());
         }
     }
 
     /// Measures and places the list after its row text changes.
     fn layout_windows(&mut self, slot: usize, mut rows: Vec<String>, mut targets: Vec<isize>) {
         let scale = self.dpi as f32 / 96.0;
+        let thumbnails = self.window_list_mode == WindowListMode::Thumbnails;
         let mut info = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
@@ -2963,7 +3054,11 @@ impl State {
         let anchor = self.item_rect(slot);
         let gap = (6.0 * scale).round() as i32;
         let available = anchor.top - gap - (info.rcWork.top + gap);
-        let capacity = logic::window_list_rows(available, scale, logic::LIST_PAD.1);
+        let capacity = if thumbnails {
+            logic::thumbnail_rows(available, scale)
+        } else {
+            logic::window_list_rows(available, scale, logic::LIST_PAD.1)
+        };
         if capacity == 0 {
             self.hide_windows();
             return;
@@ -2977,11 +3072,20 @@ impl State {
             targets.truncate(visible);
             rows.push(format!("+{} more", total - visible));
         }
-        let Ok((width, height)) = self.windows_renderer.measure_windows(&rows) else {
-            self.hide_windows();
-            return;
+        let (width, height) = if thumbnails {
+            let more = rows.last().is_some_and(|row| row.starts_with('+'));
+            let previews = rows.len() - usize::from(more);
+            (
+                ((logic::THUMB_W + 2.0 * logic::THUMB_PAD) * scale).ceil() as i32,
+                logic::thumbnail_height(previews, more, scale),
+            )
+        } else {
+            let Ok((width, height)) = self.windows_renderer.measure_windows(&rows) else {
+                self.hide_windows();
+                return;
+            };
+            ((width * scale).ceil() as i32, (height * scale).ceil() as i32)
         };
-        let (width, height) = ((width * scale).ceil() as i32, (height * scale).ceil() as i32);
         let x = ((anchor.left + anchor.right - width) / 2)
             .min(info.rcWork.right - gap - width)
             .max(info.rcWork.left + gap);
@@ -3001,13 +3105,23 @@ impl State {
             );
             let _ = InvalidateRect(Some(self.windows), None, false);
         }
+        self.thumbnails.set_base(RECT {
+            left: x,
+            top: anchor.top - gap - height,
+            right: x + width,
+            bottom: anchor.top - gap,
+        });
     }
 
     /// The row of the window list under a popup pointer position.
     fn windows_hit(&self, lp: LPARAM) -> Option<usize> {
         let scale = self.dpi as f32 / 96.0;
         let y = ((lp.0 >> 16) as i16) as f32 / scale;
-        let row = (y - logic::LIST_PAD.1) / logic::LIST_ROW;
+        let row = if self.window_list_mode == WindowListMode::Thumbnails {
+            (y - logic::THUMB_PAD) / logic::THUMB_ROW
+        } else {
+            (y - logic::LIST_PAD.1) / logic::LIST_ROW
+        };
         (row >= 0.0)
             .then_some(row as usize)
             .filter(|&row| row < self.windows_targets.len())
@@ -4002,8 +4116,12 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT
                             && (rect.top..rect.bottom).contains(&cursor.y)
                     };
                     if !over(s.hwnd) && !over(s.windows) {
-                        s.hide_windows();
+                        s.hide_thumb_anim();
                     }
+                    return LRESULT(0);
+                }
+                WM_TIMER if wp.0 == thumbnails::TIMER => {
+                    s.step_thumb_anim();
                     return LRESULT(0);
                 }
                 WM_RADIOS => {
@@ -4281,6 +4399,7 @@ unsafe fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> L
                     };
                     s.away = 0;
                     let _ = KillTimer(Some(s.hwnd), WINDOWS_HIDE_TIMER);
+                    s.cancel_thumb_hide();
                     let hover = s.windows_hit(lp);
                     if s.windows_hover != hover {
                         s.windows_hover = hover;
@@ -4332,9 +4451,16 @@ unsafe fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> L
                         dpi,
                         windows_rows,
                         windows_hover,
+                        window_list_mode,
                         ..
                     } = &mut *s;
-                    if let Err(error) = windows_renderer.draw_windows(hwnd, *dpi, palette, windows_rows, *windows_hover)
+                    let style = if *window_list_mode == WindowListMode::Thumbnails {
+                        render::WindowRows::Previews
+                    } else {
+                        render::WindowRows::Titles
+                    };
+                    if let Err(error) =
+                        windows_renderer.draw_windows(hwnd, *dpi, palette, windows_rows, *windows_hover, style)
                     {
                         eprintln!("Dock window list: {error}");
                     }
