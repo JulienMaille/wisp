@@ -35,6 +35,8 @@ struct Target {
     bitmaps: HashMap<String, (Arc<IconPixels>, ID2D1Bitmap)>,
     /// Notification-area icons, by their tray identity.
     tray: HashMap<Key, (Arc<IconPixels>, ID2D1Bitmap)>,
+    /// Live WGC frames, by preview column.
+    captures: HashMap<usize, (Arc<IconPixels>, ID2D1Bitmap)>,
     size: D2D_SIZE_U,
 }
 
@@ -304,6 +306,7 @@ impl Renderer {
                 brush: unsafe { rt.CreateSolidColorBrush(&frame.palette.text, None)? },
                 bitmaps: HashMap::new(),
                 tray: HashMap::new(),
+                    captures: HashMap::new(),
                 size: D2D_SIZE_U::default(),
             });
         }
@@ -364,6 +367,7 @@ impl Renderer {
         rows: &[String],
         hover: Option<usize>,
         style: WindowRows,
+        captures: &[(usize, Arc<IconPixels>)],
     ) -> Result<()> {
         self.paint(hwnd, dpi, palette, |target, formats| {
             background(target, palette, 1.0);
@@ -371,6 +375,45 @@ impl Renderer {
             let previews = style == WindowRows::Previews;
             let more = previews && rows.last().is_some_and(|row| row.starts_with('+'));
             let tiles = rows.len() - usize::from(more);
+            if previews {
+                let pad = logic::THUMB_PAD;
+                let step = logic::THUMB_W + pad;
+                for &(column, ref pixels) in captures {
+                    let stale = target.captures.get(&column).is_none_or(|(old, _)| !Arc::ptr_eq(old, pixels));
+                    if stale {
+                        let bitmap = unsafe {
+                            target.rt.CreateBitmap(
+                                D2D_SIZE_U {
+                                    width: pixels.width,
+                                    height: pixels.height,
+                                },
+                                Some(pixels.bgra.as_ptr().cast()),
+                                pixels.width * 4,
+                                &D2D1_BITMAP_PROPERTIES {
+                                    pixelFormat: D2D1_PIXEL_FORMAT {
+                                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                                    },
+                                    dpiX: 96.0,
+                                    dpiY: 96.0,
+                                },
+                            )?
+                        };
+                        target.captures.insert(column, (pixels.clone(), bitmap));
+                    }
+                    let left = pad + column as f32 * step + 2.0;
+                    let top = pad + 2.0;
+                    unsafe {
+                        target.rt.DrawBitmap(
+                            &target.captures[&column].1,
+                            Some(&rect(left, top, left + logic::THUMB_W - 4.0, top + logic::THUMB_H - 4.0)),
+                            1.0,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                            None,
+                        );
+                    }
+                }
+            }
             for (index, row) in rows.iter().enumerate() {
                 let (line, highlight) = if previews {
                     let pad = logic::THUMB_PAD;
@@ -539,6 +582,7 @@ impl Renderer {
                     rt,
                     bitmaps: HashMap::new(),
                     tray: HashMap::new(),
+                    captures: HashMap::new(),
                     size,
                 });
             }
@@ -1090,3 +1134,4 @@ mod own_width_tests {
         Ok(())
     }
 }
+

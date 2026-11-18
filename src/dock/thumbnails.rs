@@ -5,26 +5,25 @@
 //! reach the popup beneath, and are owned by that popup so they die with it.
 //! A layered overlay above them tints the hovered tile like the taskbar does.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::PAINTSTRUCT;
-use windows::Win32::Foundation::COLORREF;
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DWM_THUMBNAIL_PROPERTIES,
     DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
 };
-use windows::Win32::Graphics::Gdi::{
-    COLOR_WINDOW, BeginPaint, EndPaint, FillRect, GetSysColorBrush,
-};
+use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, BeginPaint, EndPaint, FillRect, GetSysColorBrush, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowRect, HTTRANSPARENT, HWND_TOPMOST,
-    IsWindow, KillTimer, LWA_ALPHA, SetLayeredWindowAttributes,
-    SetTimer, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WM_NCHITTEST,
-    WM_PAINT, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE,
+    HTTRANSPARENT, HWND_TOPMOST, IsWindow, KillTimer, LWA_ALPHA, SetLayeredWindowAttributes, SetTimer, SetWindowPos,
+    ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WM_NCHITTEST, WM_PAINT,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, w};
+
+use crate::indexer::IconPixels;
 
 use super::logic;
 
@@ -61,6 +60,9 @@ struct Anim {
 /// The previews, their animation, and the popup geometry they follow.
 pub struct Thumbnails {
     previews: Vec<Preview>,
+    /// WGC capture for windows DWM cannot preview: (column, source HWND).
+    captures: Vec<(usize, isize)>,
+    capture: Option<super::capture::Capture>,
     /// One layered wash, moved over whichever tile the pointer rests on.
     overlay: HWND,
     anim: Option<Anim>,
@@ -80,6 +82,8 @@ impl Thumbnails {
     pub fn new() -> Self {
         Self {
             previews: Vec::new(),
+            captures: Vec::new(),
+            capture: super::capture::Capture::new(),
             overlay: HWND::default(),
             anim: None,
             targets: Vec::new(),
@@ -89,7 +93,17 @@ impl Thumbnails {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.previews.is_empty()
+        self.previews.is_empty() && self.captures.is_empty()
+    }
+
+    /// Latest WGC frames, keyed by tile column, for the renderer to draw.
+    pub fn captures(&mut self) -> Vec<(usize, Arc<IconPixels>)> {
+        let Some(capture) = &mut self.capture else { return Vec::new() };
+        capture.poll();
+        self.captures
+            .iter()
+            .filter_map(|&(column, hwnd)| capture.frame(hwnd).map(|pixels| (column, pixels)))
+            .collect()
     }
 
     /// How far the previews are currently faded in.
@@ -119,8 +133,8 @@ impl Thumbnails {
         self.base = base;
     }
 
-    /// Reports DWM failures when probing with `WISP_DEBUG_THUMBS=1`.
-    fn fail(what: &str, error: &windows::core::Error) {
+    /// Reports capture failures when probing with `WISP_DEBUG_THUMBS=1`.
+    pub(crate) fn debug(what: &str, error: &windows::core::Error) {
         if std::env::var_os("WISP_DEBUG_THUMBS").is_some() {
             eprintln!("Dock thumbnails: {what}: {error}");
         }
@@ -134,6 +148,10 @@ impl Thumbnails {
                 let _ = DestroyWindow(preview.host);
             }
         }
+        if let Some(capture) = &mut self.capture {
+            capture.clear();
+        }
+        self.captures.clear();
         if !self.overlay.is_invalid() {
             unsafe {
                 let _ = ShowWindow(self.overlay, SW_HIDE);
@@ -152,10 +170,23 @@ impl Thumbnails {
         self.clear();
         self.targets = targets.to_vec();
         let Ok(instance) = (unsafe { GetModuleHandleW(None) }) else { return };
+        let scale = dpi as f32 / 96.0;
+        let frame_w = (logic::THUMB_W * scale).round().max(1.0) as u32;
+        let frame_h = (logic::THUMB_H * scale).round().max(1.0) as u32;
         for (column, &target) in targets.iter().enumerate() {
             let source = HWND(target as _);
             // DWM can preview minimized windows too, as the taskbar does.
             if !unsafe { IsWindow(Some(source)) }.as_bool() {
+                continue;
+            }
+            // Chromium-style windows have no redirection bitmap; DWM shows
+            // black for them, so use WGC instead.
+            let style = unsafe { GetWindowLongPtrW(source, GWL_EXSTYLE) };
+            if style & (WS_EX_NOREDIRECTIONBITMAP.0 as isize) != 0 {
+                if let Some(capture) = &mut self.capture {
+                    capture.start(target, popup.0 as usize, frame_w, frame_h);
+                }
+                self.captures.push((column, target));
                 continue;
             }
             // DWM rejects a child as the destination: the host must be top-level.
@@ -180,7 +211,7 @@ impl Thumbnails {
             match unsafe { DwmRegisterThumbnail(host, source) } {
                 Ok(id) => self.previews.push(Preview { id, host, column }),
                 Err(error) => {
-                    Self::fail("register", &error);
+                    Self::debug("register", &error);
                     unsafe {
                         let _ = DestroyWindow(host);
                     }
@@ -260,7 +291,7 @@ impl Thumbnails {
         let opacity = (255.0 * amount).round().clamp(0.0, 255.0) as u8;
         let mut rect = RECT::default();
         if let Err(error) = unsafe { GetWindowRect(popup, &mut rect) } {
-            Self::fail("popup rect", &error);
+            Self::debug("popup rect", &error);
             return;
         }
         for preview in &self.previews {
@@ -290,7 +321,7 @@ impl Thumbnails {
                 fSourceClientAreaOnly: BOOL(0),
             };
             if let Err(error) = unsafe { DwmUpdateThumbnailProperties(preview.id, &properties) } {
-                Self::fail("update", &error);
+                Self::debug("update", &error);
             }
         }
     }
@@ -424,3 +455,6 @@ mod tests {
         assert!(DEBOUNCE < Duration::from_millis(450));
     }
 }
+
+
+

@@ -5,6 +5,8 @@ mod dodge;
 
 #[path = "dock/artwork.rs"]
 mod artwork;
+#[path = "dock/capture.rs"]
+mod capture;
 #[path = "dock/desktops.rs"]
 mod desktops;
 #[path = "dock/jump_lists.rs"]
@@ -4466,6 +4468,7 @@ unsafe fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> L
                         windows_rows,
                         windows_hover,
                         window_list_mode,
+                        thumbnails,
                         ..
                     } = &mut *s;
                     let style = if *window_list_mode == WindowListMode::Thumbnails {
@@ -4473,9 +4476,16 @@ unsafe fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> L
                     } else {
                         render::WindowRows::Titles
                     };
-                    if let Err(error) =
-                        windows_renderer.draw_windows(hwnd, *dpi, palette, windows_rows, *windows_hover, style)
-                    {
+                    let frames = thumbnails.captures();
+                    if let Err(error) = windows_renderer.draw_windows(
+                        hwnd,
+                        *dpi,
+                        palette,
+                        windows_rows,
+                        *windows_hover,
+                        style,
+                        &frames,
+                    ) {
                         eprintln!("Dock window list: {error}");
                     }
                     let _ = EndPaint(hwnd, &paint);
