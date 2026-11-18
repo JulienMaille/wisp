@@ -22,6 +22,13 @@ use super::logic::{ICON_CENTER_Y, INDICATOR_TOP, TILE_BOTTOM, TILE_RADIUS, TILE_
 const UPPER: (f32, f32) = (8.0, 29.0);
 const LOWER: (f32, f32) = (28.0, 48.0);
 
+/// How an app's windows are shown in the hover popup.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WindowRows {
+    Titles,
+    Previews,
+}
+
 struct Target {
     rt: ID2D1HwndRenderTarget,
     brush: ID2D1SolidColorBrush,
@@ -47,6 +54,8 @@ struct Formats {
     tip: IDWriteTextFormat,
     /// One line of the window list, clipped at the card's edge.
     row: IDWriteTextFormat,
+    /// Thumbnail titles, shortened with an ellipsis when they overrun.
+    thumb_row: IDWriteTextFormat,
 }
 
 /// The factories, fonts and text formats every dock window draws with. The
@@ -186,6 +195,25 @@ fn create_formats(dw: &IDWriteFactory, text: PCWSTR, display: PCWSTR, icons: PCW
             w!("en-us"),
         )?;
         row.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+        let thumb_row = dw.CreateTextFormat(
+            text,
+            None,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            11.5 * scale,
+            w!("en-us"),
+        )?;
+        thumb_row.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+        thumb_row.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+        thumb_row.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        let trimming = DWRITE_TRIMMING {
+            granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+            delimiter: 0,
+            delimiterCount: 0,
+        };
+        let ellipsis = dw.CreateEllipsisTrimmingSign(&thumb_row)?;
+        thumb_row.SetTrimming(&trimming, &ellipsis)?;
         Ok(Formats {
             letter: format(display, DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0)?,
             time: format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0)?,
@@ -198,6 +226,7 @@ fn create_formats(dw: &IDWriteFactory, text: PCWSTR, display: PCWSTR, icons: PCW
             badge: format(icons, DWRITE_FONT_WEIGHT_NORMAL, 8.0)?,
             tip,
             row,
+            thumb_row,
         })
     }
 }
@@ -325,7 +354,8 @@ impl Renderer {
         }
     }
 
-    /// Draws an app's windows as a list, highlighting the row under the pointer.
+    /// Draws an app's windows as a list, or as labels under live DWM previews.
+    /// The previews live in top-level host windows above this surface.
     pub fn draw_windows(
         &mut self,
         hwnd: HWND,
@@ -333,30 +363,53 @@ impl Renderer {
         palette: &Palette,
         rows: &[String],
         hover: Option<usize>,
+        style: WindowRows,
     ) -> Result<()> {
         self.paint(hwnd, dpi, palette, |target, formats| {
             background(target, palette, 1.0);
             let size = unsafe { target.rt.GetSize() };
+            let previews = style == WindowRows::Previews;
+            let more = previews && rows.last().is_some_and(|row| row.starts_with('+'));
+            let tiles = rows.len() - usize::from(more);
             for (index, row) in rows.iter().enumerate() {
-                let top = logic::LIST_PAD.1 + index as f32 * logic::LIST_ROW;
-                let line = rect(
-                    logic::LIST_PAD.0,
-                    top,
-                    size.width - logic::LIST_PAD.0,
-                    top + logic::LIST_ROW,
-                );
+                let (line, highlight) = if previews {
+                    let pad = logic::THUMB_PAD;
+                    if more && index == tiles {
+                        // The "+N more" row is text only and sits below the tiles.
+                        let top = pad + tiles as f32 * logic::THUMB_ROW;
+                        let slim = rect(pad, top, size.width - pad, top + logic::THUMB_MORE_H);
+                        (slim, slim)
+                    } else {
+                        let top = pad + index as f32 * logic::THUMB_ROW;
+                        let title = top + logic::THUMB_H;
+                        (
+                            rect(pad, title, size.width - pad, title + logic::THUMB_TITLE_H),
+                            rect(pad, top, size.width - pad, title + logic::THUMB_TITLE_H),
+                        )
+                    }
+                } else {
+                    let top = logic::LIST_PAD.1 + index as f32 * logic::LIST_ROW;
+                    let line = rect(
+                        logic::LIST_PAD.0,
+                        top,
+                        size.width - logic::LIST_PAD.0,
+                        top + logic::LIST_ROW,
+                    );
+                    (line, line)
+                };
                 if hover == Some(index) {
                     unsafe {
                         target.brush.SetColor(&palette.row_selected);
-                        target.rt.FillRoundedRectangle(&rounded(line, 4.0), &target.brush);
+                        target.rt.FillRoundedRectangle(&rounded(highlight, 4.0), &target.brush);
                     }
                 }
                 unsafe { target.brush.SetColor(&palette.text) };
                 let wide: Vec<u16> = row.encode_utf16().collect();
+                let format = if previews { &formats.thumb_row } else { &formats.row };
                 unsafe {
                     target.rt.DrawText(
                         &wide,
-                        &formats.row,
+                        format,
                         &line,
                         &target.brush,
                         D2D1_DRAW_TEXT_OPTIONS_CLIP,
