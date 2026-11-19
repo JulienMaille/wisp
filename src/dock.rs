@@ -1681,9 +1681,25 @@ impl State {
             .windows_slot
             .and_then(|slot| self.item_at(slot))
             .map(|item| (item.app.id.clone(), item.app.name.clone(), item.windows.clone()));
-        self.items = logic::stable_order(std::mem::take(&mut self.items), items, |old, new| {
+        let previous_items = std::mem::take(&mut self.items);
+        let previous_windows: Vec<(String, Vec<Window>)> = previous_items
+            .iter()
+            .map(|item| (item.app.id.clone(), item.windows.clone()))
+            .collect();
+        self.items = logic::stable_order(previous_items, items, |old, new| {
             old.app.id.eq_ignore_ascii_case(&new.app.id)
         });
+        // An app's windows also arrive in z-order. Keep each instance in the
+        // order it first appeared so focusing one does not shuffle the previews.
+        for item in &mut self.items {
+            if let Some((_, old)) = previous_windows.iter().find(|(id, _)| id.eq_ignore_ascii_case(&item.app.id)) {
+                item.windows = logic::stable_order(
+                    old.clone(),
+                    std::mem::take(&mut item.windows),
+                    |old, new| old.hwnd == new.hwnd,
+                );
+            }
+        }
         self.order_pins();
         if let Some(slot) = self.windows_slot
             && self.item_at(slot).is_none_or(|item| {
