@@ -981,25 +981,48 @@ impl Dock {
         if unsafe { RegisterClassExW(&tint) } == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
             return Err(Error::from_thread());
         }
-        for (kind, style, title) in [
+        // Chromium stops rendering occluded windows, which makes both DWM
+        // thumbnails and WGC black. It watches for the taskbar's preview class
+        // to show and un-occludes its windows. Use that class for the list so
+        // previews of Chromium apps get fresh frames too.
+        let previews = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(popup_wndproc),
+            hInstance: instance.into(),
+            lpszClassName: w!("TaskListThumbnailWnd"),
+            hCursor: class.hCursor,
+            cbWndExtra: size_of::<isize>() as i32,
+            ..Default::default()
+        };
+        if unsafe { RegisterClassExW(&previews) } == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
+            return Err(Error::from_thread());
+        }
+        for (kind, style, title, class) in [
             // The flyout takes focus, for Esc and closing on a click elsewhere.
-            (Popup::Flyout, WS_EX_TOOLWINDOW | WS_EX_TOPMOST, w!("Notification area")),
+            (
+                Popup::Flyout,
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                w!("Notification area"),
+                popup.lpszClassName,
+            ),
             (
                 Popup::Tip,
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
                 w!("Wisp Dock tooltip"),
+                popup.lpszClassName,
             ),
             // The window list takes clicks, but not the focus.
             (
                 Popup::Windows,
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
                 w!("Wisp Dock windows"),
+                previews.lpszClassName,
             ),
         ] {
             let window = unsafe {
                 CreateWindowExW(
                     style,
-                    popup.lpszClassName,
+                    class,
                     title,
                     WS_POPUP | WS_CAPTION,
                     0,
@@ -3130,6 +3153,11 @@ impl State {
                 height,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
+            // Chromium's occlusion hook listens for EVENT_OBJECT_SHOW on the
+            // taskbar preview class; SWP_SHOWWINDOW alone does not raise it.
+            if self.window_list_mode == WindowListMode::Thumbnails {
+                let _ = ShowWindow(self.windows, SW_SHOWNOACTIVATE);
+            }
             let _ = InvalidateRect(Some(self.windows), None, false);
         }
         self.thumbnails.set_base(RECT {
@@ -4492,7 +4520,7 @@ unsafe fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> L
                     } else {
                         render::WindowRows::Titles
                     };
-                    let frames = thumbnails.captures();
+                    let frames = thumbnails.captures(*dpi);
                     if let Err(error) = windows_renderer.draw_windows(
                         hwnd,
                         *dpi,
@@ -4941,3 +4969,4 @@ mod tests {
         }
     }
 }
+

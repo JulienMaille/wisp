@@ -96,13 +96,23 @@ impl Thumbnails {
         self.previews.is_empty() && self.captures.is_empty()
     }
 
-    /// Latest WGC frames, keyed by tile column, for the renderer to draw.
-    pub fn captures(&mut self) -> Vec<(usize, Arc<IconPixels>)> {
+    /// Latest frames, keyed by tile column, for the renderer to draw.
+    /// PrintWindow runs on this STA thread: Chromium returns black from the
+    /// WGC worker's MTA thread. WGC frames are the fallback.
+    pub fn captures(&mut self, dpi: u32) -> Vec<(usize, Arc<IconPixels>)> {
         let Some(capture) = &mut self.capture else { return Vec::new() };
         capture.poll();
+        let scale = dpi as f32 / 96.0;
+        let width = (logic::THUMB_W * scale).round().max(1.0) as u32;
+        let height = (logic::THUMB_H * scale).round().max(1.0) as u32;
         self.captures
             .iter()
-            .filter_map(|&(column, hwnd)| capture.frame(hwnd).map(|pixels| (column, pixels)))
+            .filter_map(|&(column, hwnd)| {
+                super::capture::print_window(hwnd, width, height)
+                    .map(Arc::new)
+                    .or_else(|| capture.frame(hwnd))
+                    .map(|pixels| (column, pixels))
+            })
             .collect()
     }
 
@@ -455,6 +465,7 @@ mod tests {
         assert!(DEBOUNCE < Duration::from_millis(450));
     }
 }
+
 
 
 

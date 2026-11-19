@@ -56,8 +56,6 @@ struct Stream {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     token: i64,
-    width: u32,
-    height: u32,
 }
 
 /// A WGC worker plus the frames it has produced, read by the dock thread.
@@ -124,7 +122,6 @@ fn worker(commands: Receiver<Command>, frames: Sender<Frame>) {
         Thumbnails::debug("WGC RoInitialize", &error);
     }
     let mut streams: HashMap<isize, Stream> = HashMap::new();
-    let mut last_refresh = std::time::Instant::now();
     let mut device = None;
     if let Err(error) = unsafe {
         D3D11CreateDevice(
@@ -201,19 +198,6 @@ fn worker(commands: Receiver<Command>, frames: Sender<Frame>) {
         let mut msg = Default::default();
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
             let _ = unsafe { DispatchMessageW(&msg) };
-        }
-        // WGC throttles occluded windows to a trickle. Refresh them on demand
-        // so a hovered preview does not sit on a stale frame.
-        if last_refresh.elapsed() >= Duration::from_millis(150) {
-            last_refresh = std::time::Instant::now();
-            for (hwnd, stream) in &streams {
-                if let Some(pixels) = print_window(*hwnd, stream.width, stream.height) {
-                    let _ = frames.send(Frame {
-                        hwnd: *hwnd,
-                        pixels: Arc::new(pixels),
-                    });
-                }
-            }
         }
     }
     let keys: Vec<isize> = streams.keys().copied().collect();
@@ -305,13 +289,7 @@ fn start_stream(
         let _ = pool.RemoveFrameArrived(token);
         return Thumbnails::debug("WGC StartCapture", &error);
     }
-    streams.insert(hwnd, Stream {
-        pool,
-        session,
-        token,
-        width,
-        height,
-    });
+    streams.insert(hwnd, Stream { pool, session, token });
 }
 
 fn stop_stream(streams: &mut HashMap<isize, Stream>, hwnd: isize) {
@@ -324,7 +302,7 @@ fn stop_stream(streams: &mut HashMap<isize, Stream>, hwnd: isize) {
 
 /// Prints a window on demand, downsampled to the tile. This keeps previews
 /// fresh when WGC stops delivering frames for an occluded window.
-fn print_window(hwnd: isize, target_w: u32, target_h: u32) -> Option<IconPixels> {
+pub fn print_window(hwnd: isize, target_w: u32, target_h: u32) -> Option<IconPixels> {
     let source = HWND(hwnd as *mut core::ffi::c_void);
     let mut rect = RECT::default();
     if unsafe { GetWindowRect(source, &mut rect) }.is_err() {
@@ -336,7 +314,9 @@ fn print_window(hwnd: isize, target_w: u32, target_h: u32) -> Option<IconPixels>
     }
     unsafe {
         let dc = CreateCompatibleDC(None);
-        let bitmap = CreateCompatibleBitmap(dc, sw as i32, sh as i32);
+        let screen = windows::Win32::Graphics::Gdi::GetDC(None);
+        let bitmap = CreateCompatibleBitmap(screen, sw as i32, sh as i32);
+        let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, screen);
         if dc.is_invalid() || bitmap.is_invalid() {
             if !bitmap.is_invalid() { let _ = DeleteObject(bitmap.into()); }
             if !dc.is_invalid() { let _ = DeleteDC(dc); }
@@ -449,6 +429,7 @@ fn copy_frame(
         })
     }
 }
+
 
 
 
