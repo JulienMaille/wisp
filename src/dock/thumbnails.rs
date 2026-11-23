@@ -10,15 +10,15 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DWM_THUMBNAIL_PROPERTIES,
+    DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
     DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
 };
-use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, BeginPaint, EndPaint, FillRect, GetSysColorBrush, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, COLOR_WINDOW, EndPaint, FillRect, GetSysColorBrush, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE,
-    HTTRANSPARENT, HWND_TOPMOST, IsWindow, KillTimer, LWA_ALPHA, SetLayeredWindowAttributes, SetTimer, SetWindowPos,
-    ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WM_NCHITTEST, WM_PAINT,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW, GetWindowRect,
+    HTTRANSPARENT, HWND_TOPMOST, IsWindow, KillTimer, LWA_ALPHA, SW_HIDE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, WM_NCHITTEST, WM_PAINT,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, w};
@@ -100,7 +100,9 @@ impl Thumbnails {
     /// PrintWindow runs on this STA thread: Chromium returns black from the
     /// WGC worker's MTA thread. WGC frames are the fallback.
     pub fn captures(&mut self, dpi: u32) -> Vec<(usize, Arc<IconPixels>)> {
-        let Some(capture) = &mut self.capture else { return Vec::new() };
+        let Some(capture) = &mut self.capture else {
+            return Vec::new();
+        };
         capture.poll();
         let scale = dpi as f32 / 96.0;
         let width = (logic::THUMB_W * scale).round().max(1.0) as u32;
@@ -123,7 +125,11 @@ impl Thumbnails {
         let duration = if showing { SHOW_MS } else { HIDE_MS };
         let t = (anim.started.elapsed().as_secs_f32() / (duration as f32 / 1000.0)).clamp(0.0, 1.0);
         // A quick ease-out on arrival, a plain gentle fade on the way out.
-        let eased = if showing { crate::ease::out_cubic(t) } else { crate::ease::smoothstep(t) };
+        let eased = if showing {
+            crate::ease::out_cubic(t)
+        } else {
+            crate::ease::smoothstep(t)
+        };
         anim.from + (anim.to - anim.from) * eased
     }
 
@@ -179,7 +185,9 @@ impl Thumbnails {
         }
         self.clear();
         self.targets = targets.to_vec();
-        let Ok(instance) = (unsafe { GetModuleHandleW(None) }) else { return };
+        let Ok(instance) = (unsafe { GetModuleHandleW(None) }) else {
+            return;
+        };
         let scale = dpi as f32 / 96.0;
         let frame_w = (logic::THUMB_W * scale).round().max(1.0) as u32;
         let frame_h = (logic::THUMB_H * scale).round().max(1.0) as u32;
@@ -261,7 +269,9 @@ impl Thumbnails {
             return;
         }
         let Some(preview) = column.and_then(|col| self.previews.iter().find(|p| p.column == col)) else {
-            unsafe { let _ = ShowWindow(self.overlay, SW_HIDE); }
+            unsafe {
+                let _ = ShowWindow(self.overlay, SW_HIDE);
+            }
             return;
         };
         let scale = dpi as f32 / 96.0;
@@ -465,7 +475,3 @@ mod tests {
         assert!(DEBOUNCE < Duration::from_millis(450));
     }
 }
-
-
-
-

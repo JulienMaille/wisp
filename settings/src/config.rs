@@ -77,7 +77,11 @@ impl Config {
         let position = string("position")?;
         choice(&position, &["center", "bottom"], "position")?;
         let window_list = string("window_list")?;
-        choice(&window_list, &["always", "multiple", "thumbnails", "off"], "window_list")?;
+        choice(
+            &window_list,
+            &["always", "multiple", "thumbnails", "off"],
+            "window_list",
+        )?;
         let dock_icon_size = get("dock_icon_size")
             .as_integer()
             .filter(|value| *value >= 0)
@@ -494,7 +498,10 @@ mod tests {
             assert!(store.set(key, value).is_err(), "{key}");
         }
         assert!(!store.path.exists());
-        assert_eq!(store.set("window_list", "thumbnails".into()).unwrap().window_list, "thumbnails");
+        assert_eq!(
+            store.set("window_list", "thumbnails".into()).unwrap().window_list,
+            "thumbnails"
+        );
         assert!(validate_url("https://example.com/?q={query}").is_ok());
         assert!(validate_url("https://example.com/?q={QUERY}").is_err());
         assert_eq!(store.set("max_results", 20.into()).unwrap().max_results, 20);

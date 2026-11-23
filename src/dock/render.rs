@@ -306,7 +306,7 @@ impl Renderer {
                 brush: unsafe { rt.CreateSolidColorBrush(&frame.palette.text, None)? },
                 bitmaps: HashMap::new(),
                 tray: HashMap::new(),
-                    captures: HashMap::new(),
+                captures: HashMap::new(),
                 size: D2D_SIZE_U::default(),
             });
         }
@@ -359,6 +359,7 @@ impl Renderer {
 
     /// Draws an app's windows as a list, or as labels under live DWM previews.
     /// The previews live in top-level host windows above this surface.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_windows(
         &mut self,
         hwnd: HWND,
@@ -379,7 +380,10 @@ impl Renderer {
                 let pad = logic::THUMB_PAD;
                 let step = logic::THUMB_W + pad;
                 for &(column, ref pixels) in captures {
-                    let stale = target.captures.get(&column).is_none_or(|(old, _)| !Arc::ptr_eq(old, pixels));
+                    let stale = target
+                        .captures
+                        .get(&column)
+                        .is_none_or(|(old, _)| !Arc::ptr_eq(old, pixels));
                     if stale {
                         let bitmap = unsafe {
                             target.rt.CreateBitmap(
@@ -406,7 +410,12 @@ impl Renderer {
                     unsafe {
                         target.rt.DrawBitmap(
                             &target.captures[&column].1,
-                            Some(&rect(left, top, left + logic::THUMB_W - 4.0, top + logic::THUMB_H - 4.0)),
+                            Some(&rect(
+                                left,
+                                top,
+                                left + logic::THUMB_W - 4.0,
+                                top + logic::THUMB_H - 4.0,
+                            )),
                             1.0,
                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                             None,
@@ -1134,4 +1143,3 @@ mod own_width_tests {
         Ok(())
     }
 }
-

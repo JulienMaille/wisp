@@ -1715,12 +1715,13 @@ impl State {
         // An app's windows also arrive in z-order. Keep each instance in the
         // order it first appeared so focusing one does not shuffle the previews.
         for item in &mut self.items {
-            if let Some((_, old)) = previous_windows.iter().find(|(id, _)| id.eq_ignore_ascii_case(&item.app.id)) {
-                item.windows = logic::stable_order(
-                    old.clone(),
-                    std::mem::take(&mut item.windows),
-                    |old, new| old.hwnd == new.hwnd,
-                );
+            if let Some((_, old)) = previous_windows
+                .iter()
+                .find(|(id, _)| id.eq_ignore_ascii_case(&item.app.id))
+            {
+                item.windows = logic::stable_order(old.clone(), std::mem::take(&mut item.windows), |old, new| {
+                    old.hwnd == new.hwnd
+                });
             }
         }
         self.order_pins();
@@ -3024,7 +3025,12 @@ impl State {
                 let elapsed = at.elapsed();
                 if elapsed < debounce {
                     unsafe {
-                        let _ = SetTimer(Some(self.hwnd), WINDOWS_TIMER, (debounce - elapsed).as_millis() as u32, None);
+                        let _ = SetTimer(
+                            Some(self.hwnd),
+                            WINDOWS_TIMER,
+                            (debounce - elapsed).as_millis() as u32,
+                            None,
+                        );
                     }
                     return;
                 }
@@ -3128,7 +3134,10 @@ impl State {
         let (width, height) = if thumbnails {
             let more = rows.last().is_some_and(|row| row.starts_with('+'));
             let tiles = rows.len() - usize::from(more);
-            (logic::thumbnail_width(tiles, more, scale), logic::thumbnail_height(scale))
+            (
+                logic::thumbnail_width(tiles, more, scale),
+                logic::thumbnail_height(scale),
+            )
         } else {
             let Ok((width, height)) = self.windows_renderer.measure_windows(&rows) else {
                 self.hide_windows();
@@ -4521,15 +4530,9 @@ unsafe fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> L
                         render::WindowRows::Titles
                     };
                     let frames = thumbnails.captures(*dpi);
-                    if let Err(error) = windows_renderer.draw_windows(
-                        hwnd,
-                        *dpi,
-                        palette,
-                        windows_rows,
-                        *windows_hover,
-                        style,
-                        &frames,
-                    ) {
+                    if let Err(error) =
+                        windows_renderer.draw_windows(hwnd, *dpi, palette, windows_rows, *windows_hover, style, &frames)
+                    {
                         eprintln!("Dock window list: {error}");
                     }
                     let _ = EndPaint(hwnd, &paint);
@@ -4969,4 +4972,3 @@ mod tests {
         }
     }
 }
-

@@ -18,18 +18,18 @@ use windows::UI::WindowId;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_USAGE_STAGING, D3D11CreateDevice, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_TEXTURE2D_DESC, D3D11_SDK_VERSION, ID3D11Device, ID3D11DeviceContext,
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
     DeleteObject, GetDIBits, SelectObject,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, PW_RENDERFULLCONTENT};
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
-use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, PM_REMOVE};
+use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PM_REMOVE, PeekMessageW};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, PW_RENDERFULLCONTENT};
 use windows::core::{Interface, Ref};
 
 use crate::indexer::IconPixels;
@@ -154,13 +154,14 @@ fn worker(commands: Receiver<Command>, frames: Sender<Frame>) {
             return;
         }
     };
-    let d3d: IDirect3DDevice = match unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }.and_then(|value| value.cast()) {
-        Ok(d3d) => d3d,
-        Err(error) => {
-            Thumbnails::debug("WGC device", &error);
-            return;
-        }
-    };
+    let d3d: IDirect3DDevice =
+        match unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }.and_then(|value| value.cast()) {
+            Ok(d3d) => d3d,
+            Err(error) => {
+                Thumbnails::debug("WGC device", &error);
+                return;
+            }
+        };
 
     loop {
         match commands.recv_timeout(Duration::from_millis(16)) {
@@ -226,12 +227,7 @@ fn start_stream(
         Ok(size) => size,
         Err(error) => return Thumbnails::debug("WGC item size", &error),
     };
-    let pool = match Direct3D11CaptureFramePool::Create(
-        d3d,
-        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        2,
-        full,
-    ) {
+    let pool = match Direct3D11CaptureFramePool::Create(d3d, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, full) {
         Ok(pool) => pool,
         Err(error) => return Thumbnails::debug("WGC pool", &error),
     };
@@ -241,7 +237,7 @@ fn start_stream(
     let clock = Arc::new(Mutex::new(std::time::Instant::now()));
     let handler = TypedEventHandler::new(
         move |sender: Ref<Direct3D11CaptureFramePool>, _: Ref<windows::core::IInspectable>| {
-            let Some(pool) = (&*sender).as_ref() else { return Ok(()) };
+            let Some(pool) = (*sender).as_ref() else { return Ok(()) };
             let frame = match pool.TryGetNextFrame() {
                 Ok(frame) => frame,
                 Err(error) => {
@@ -318,12 +314,21 @@ pub fn print_window(hwnd: isize, target_w: u32, target_h: u32) -> Option<IconPix
         let bitmap = CreateCompatibleBitmap(screen, sw as i32, sh as i32);
         let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, screen);
         if dc.is_invalid() || bitmap.is_invalid() {
-            if !bitmap.is_invalid() { let _ = DeleteObject(bitmap.into()); }
-            if !dc.is_invalid() { let _ = DeleteDC(dc); }
+            if !bitmap.is_invalid() {
+                let _ = DeleteObject(bitmap.into());
+            }
+            if !dc.is_invalid() {
+                let _ = DeleteDC(dc);
+            }
             return None;
         }
         let old = SelectObject(dc, bitmap.into());
-        let printed = windows::Win32::Storage::Xps::PrintWindow(source, dc, windows::Win32::Storage::Xps::PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool();
+        let printed = windows::Win32::Storage::Xps::PrintWindow(
+            source,
+            dc,
+            windows::Win32::Storage::Xps::PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT),
+        )
+        .as_bool();
         let mut header = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -350,7 +355,9 @@ pub fn print_window(hwnd: isize, target_w: u32, target_h: u32) -> Option<IconPix
         } else {
             0
         };
-        if !old.is_invalid() { let _ = SelectObject(dc, old); }
+        if !old.is_invalid() {
+            let _ = SelectObject(dc, old);
+        }
         let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(dc);
         if lines == 0 {
@@ -384,9 +391,16 @@ fn copy_frame(
     target_h: u32,
 ) -> Option<IconPixels> {
     unsafe {
-        let surface: windows::Graphics::DirectX::Direct3D11::IDirect3DSurface = frame.Surface().inspect_err(|e| Thumbnails::debug("WGC frame surface", e)).ok()?;
-        let access: IDirect3DDxgiInterfaceAccess = surface.cast().inspect_err(|e| Thumbnails::debug("WGC surface access", e)).ok()?;
-        let texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D = access.GetInterface()
+        let surface: windows::Graphics::DirectX::Direct3D11::IDirect3DSurface = frame
+            .Surface()
+            .inspect_err(|e| Thumbnails::debug("WGC frame surface", e))
+            .ok()?;
+        let access: IDirect3DDxgiInterfaceAccess = surface
+            .cast()
+            .inspect_err(|e| Thumbnails::debug("WGC surface access", e))
+            .ok()?;
+        let texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D = access
+            .GetInterface()
             .inspect_err(|e| Thumbnails::debug("WGC texture access", e))
             .ok()?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -429,8 +443,3 @@ fn copy_frame(
         })
     }
 }
-
-
-
-
-
